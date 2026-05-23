@@ -33,8 +33,6 @@ class PatchParser:
         """
         changed_names: Set[str] = set()
 
-        # Split patch into individual file diffs (--- a/path and +++ b/path)
-        file_diff_pattern = r'^--- a/.*?\n\+\+\+ b/(.+?)$'
         current_file = None
         current_hunk = []
 
@@ -45,11 +43,16 @@ class PatchParser:
 
             # Check for file boundary: +++ b/path
             if line.startswith('+++'):
+                # Process accumulated hunk for previous file before switching
+                if current_hunk:
+                    changed_names.update(
+                        PatchParser._extract_defs_from_hunk(current_hunk)
+                    )
+                current_hunk = []
                 # Extract the file path from '+++ b/path'
                 match = re.match(r'^\+\+\+ b/(.+)$', line)
                 if match:
                     current_file = match.group(1)
-                    current_hunk = []
 
             # Within the target file, collect hunk lines
             if current_file == code_file:
