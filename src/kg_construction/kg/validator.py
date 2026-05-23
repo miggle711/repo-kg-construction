@@ -14,8 +14,10 @@ Phase I extraction bugs early:
 from typing import Dict, List, Set, Tuple
 from collections import defaultdict
 
+from kg_construction.validation.base import ValidationBase
 
-class KGValidator:
+
+class KGValidator(ValidationBase):
     """Validate Knowledge Graph structure and metadata consistency."""
 
     def __init__(self, kg: Dict):
@@ -23,6 +25,7 @@ class KGValidator:
         Args:
             kg: KG dict as returned by RepoKGBuilder.build().
         """
+        super().__init__()
         self.kg = kg
         self.nodes = kg.get('nodes', [])
         self.edges = kg.get('edges', [])
@@ -37,9 +40,6 @@ class KGValidator:
         for edge in self.edges:
             self.edges_by_source[edge['source']].append(edge)
             self.edges_by_target[edge['target']].append(edge)
-
-        self.errors: List[str] = []
-        self.warnings: List[str] = []
 
     def validate(self) -> Tuple[bool, str]:
         """Run all validations and return (success, report).
@@ -184,29 +184,9 @@ class KGValidator:
         return node['label'] if node else node_id[:8]
 
     def _format_report(self) -> Tuple[bool, str]:
-        """Format validation report."""
-        lines = [f"\n{'='*70}"]
-        lines.append(f"KG Validation Report: {self.repo}")
-        lines.append(f"{'='*70}")
-        lines.append(f"Nodes: {len(self.nodes)} | Edges: {len(self.edges)}")
-        lines.append("")
-
-        if self.errors:
-            lines.append("❌ ERRORS:")
-            for err in self.errors:
-                lines.append(f"  - {err}")
-            lines.append("")
-
-        if self.warnings:
-            lines.append("⚠️  WARNINGS:")
-            for warn in self.warnings:
-                lines.append(f"  - {warn}")
-            lines.append("")
-
-        if not self.errors and not self.warnings:
-            lines.append("✅ All checks passed")
-            lines.append("")
-
-        lines.append(f"{'='*70}\n")
-
-        return (not self.errors, "\n".join(lines))
+        """Format validation report using base class formatter."""
+        stats = f"Nodes: {len(self.nodes)} | Edges: {len(self.edges)}"
+        return super()._format_report(
+            title=f"KG Validation Report: {self.repo}",
+            stats_line=stats,
+        )
