@@ -1,0 +1,61 @@
+digraph KG_Construction {
+    rankdir=TB;
+    bgcolor=white;
+    node [shape=box, style=filled, fillcolor=lightblue, fontname="Helvetica"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    // Pass 1
+    subgraph cluster_pass1 {
+        style=filled;
+        fillcolor=lightyellow;
+        label="Pass 1: Parallel Extraction\n(ProcessPoolExecutor)";
+        color=black;
+
+        py1 [label="file1.py", fillcolor=lightblue];
+        py2 [label="file2.py", fillcolor=lightblue];
+        py3 [label="fileN.py", fillcolor=lightblue];
+
+        ast1 [label="AST Parse"];
+        ast2 [label="AST Parse"];
+        ast3 [label="AST Parse"];
+
+        extract1 [label="Extract Nodes\n& Unresolved Edges", fillcolor=lightgreen];
+        extract2 [label="Extract Nodes\n& Unresolved Edges", fillcolor=lightgreen];
+        extract3 [label="Extract Nodes\n& Unresolved Edges", fillcolor=lightgreen];
+
+        py1 -> ast1;
+        ast1 -> extract1;
+
+        py2 -> ast2;
+        ast2 -> extract2;
+
+        py3 -> ast3;
+        ast3 -> extract3;
+    }
+
+    // Aggregation
+    results [label="Aggregate Results\n(all nodes & edges)", fillcolor=lightyellow];
+    extract1 -> results;
+    extract2 -> results;
+    extract3 -> results;
+
+    // Pass 2
+    subgraph cluster_pass2 {
+        style=filled;
+        fillcolor=lightcyan;
+        label="Pass 2: Sequential Resolution";
+        color=black;
+
+        index [label="Build Global Indices\nlabel→[id], class→[id]", fillcolor=lightcoral];
+        resolve [label="Resolve Unresolved Edges\n(calls, inherits, tests)", fillcolor=lightcoral];
+        context [label="Add Call Context\n(direct_callers, caller_count)", fillcolor=lightcoral];
+
+        results -> index;
+        index -> resolve;
+        resolve -> context;
+    }
+
+    // Output
+    kg [label="Final KG\n(nodes + resolved edges)", fillcolor=lightgreen, shape=box, style="filled,bold"];
+    context -> kg;
+}
