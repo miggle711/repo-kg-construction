@@ -15,9 +15,10 @@ from typing import Dict, List, Set, Tuple
 from collections import defaultdict
 
 from kg_construction.extraction.context import TestContext
+from kg_construction.validation.base import ValidationBase
 
 
-class TestContextValidator:
+class TestContextValidator(ValidationBase):
     """Validate TestContext subgraphs for LLM test generation."""
 
     def __init__(self, context: TestContext):
@@ -25,6 +26,7 @@ class TestContextValidator:
         Args:
             context: TestContext as returned by TestContextExtractor.extract().
         """
+        super().__init__()
         self.context = context
         self.repo = context.repo
         self.base_commit = context.base_commit[:8]
@@ -45,9 +47,6 @@ class TestContextValidator:
             self.edges_by_source[edge['source']].append(edge)
             self.edges_by_target[edge['target']].append(edge)
             self.edges_by_relation[edge['relation']].append(edge)
-
-        self.errors: List[str] = []
-        self.warnings: List[str] = []
 
     def validate(self) -> Tuple[bool, str]:
         """Run all validations and return (is_valid, report_string).
@@ -186,30 +185,10 @@ class TestContextValidator:
             )
 
     def _format_report(self) -> Tuple[bool, str]:
-        """Format validation report."""
-        lines = [f"\n{'='*70}"]
-        lines.append(f"TestContext Validation Report: {self.repo} @ {self.base_commit}")
-        lines.append(f"{'='*70}")
-        lines.append(f"Seeds: {len(self.context.seeds)} | Context: {len(self.context.context_nodes)} "
-                     f"| Edges: {len(self.edges)} | Tests: {len(self.context.test_nodes)}")
-        lines.append("")
-
-        if self.errors:
-            lines.append("ERRORS (block use):")
-            for err in self.errors:
-                lines.append(f"  - {err}")
-            lines.append("")
-
-        if self.warnings:
-            lines.append("WARNINGS (monitor):")
-            for warn in self.warnings:
-                lines.append(f"  - {warn}")
-            lines.append("")
-
-        if not self.errors and not self.warnings:
-            lines.append("All checks passed")
-            lines.append("")
-
-        lines.append(f"{'='*70}\n")
-
-        return (len(self.errors) == 0, "\n".join(lines))
+        """Format validation report using base class formatter."""
+        stats = (f"Seeds: {len(self.context.seeds)} | Context: {len(self.context.context_nodes)} "
+                 f"| Edges: {len(self.edges)} | Tests: {len(self.context.test_nodes)}")
+        return super()._format_report(
+            title=f"TestContext Validation Report: {self.repo} @ {self.base_commit}",
+            stats_line=stats,
+        )
