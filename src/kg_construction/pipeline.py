@@ -118,9 +118,10 @@ def extract_and_validate(instance, depth=2, verbose=True, generate_tests=False):
     if verbose:
         print(report)
 
-    # Phase 5: Generate tests if requested
+    # Phase 5: Generate tests if requested (only if subgraph validation passed)
     generated_tests = None
-    if generate_tests:
+    test_generation_error = None
+    if generate_tests and is_valid:
         if verbose:
             print("Phase 5: Generating tests with Groq...", end=" ", flush=True)
         try:
@@ -142,12 +143,20 @@ def extract_and_validate(instance, depth=2, verbose=True, generate_tests=False):
             if verbose:
                 print("✓")
         except Exception as e:
+            test_generation_error = str(e)
             if verbose:
                 print(f"\n✗ Test generation failed: {e}")
-            generated_tests = None
+    elif generate_tests and not is_valid:
+        test_generation_error = "Skipped: subgraph validation failed (has blocking errors)"
+        if verbose:
+            print(f"⊘ Phase 5 skipped: {test_generation_error}")
 
     if generate_tests:
-        return context, report, generated_tests
+        # Append test generation error to report if one occurred
+        full_report = report
+        if test_generation_error:
+            full_report += f"\n\nPhase 5 (Test Generation): {test_generation_error}"
+        return context, full_report, generated_tests
     else:
         return context, report
 

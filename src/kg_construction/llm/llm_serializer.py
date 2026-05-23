@@ -59,26 +59,12 @@ class LLMSerializer:
         for node in seeds + context_nodes + test_nodes:
             node_by_id[node["id"]] = node
 
-        edge_by_source = {}
-        for edge in edges:
-            src = edge["source"]
-            if src not in edge_by_source:
-                edge_by_source[src] = []
-            edge_by_source[src].append(edge)
-
-        edge_by_target = {}
-        for edge in edges:
-            tgt = edge["target"]
-            if tgt not in edge_by_target:
-                edge_by_target[tgt] = []
-            edge_by_target[tgt].append(edge)
-
         # Build Seed section from seed nodes
         seed_section = self._build_seed_section(seeds, node_by_id)
 
         # Build Context section from context_nodes, edges, and test_nodes
         context_section = self._build_context_section(
-            seeds, context_nodes, test_nodes, edges, node_by_id, edge_by_source, edge_by_target
+            seeds, context_nodes, test_nodes, edges, node_by_id
         )
 
         # Build Instructions section with coverage targets and conventions
@@ -125,8 +111,6 @@ class LLMSerializer:
         test_nodes: List[Dict],
         edges: List[Dict],
         node_by_id: Dict,
-        edge_by_source: Dict,
-        edge_by_target: Dict,
     ) -> Dict:
         """Extract and structure execution context from subgraph.
 
