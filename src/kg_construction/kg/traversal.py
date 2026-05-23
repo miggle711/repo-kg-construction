@@ -61,6 +61,7 @@ class GraphTraversal:
 
         visited = set(start_ids)
         traversed_edges = []
+        seen_edge_keys = set()
         queue = deque([(node_id, 0) for node_id in start_ids])
 
         while queue:
@@ -75,7 +76,10 @@ class GraphTraversal:
                     if edge_filter is None or edge.get("relation") in edge_filter:
                         target_id = edge.get("target")
                         if target_id and target_id in kg_nodes:
-                            traversed_edges.append(edge)
+                            edge_key = (edge.get("source"), target_id, edge.get("relation"))
+                            if edge_key not in seen_edge_keys:
+                                traversed_edges.append(edge)
+                                seen_edge_keys.add(edge_key)
                             if target_id not in visited:
                                 visited.add(target_id)
                                 queue.append((target_id, current_depth + 1))
@@ -86,7 +90,10 @@ class GraphTraversal:
                     if edge_filter is None or edge.get("relation") in edge_filter:
                         source_id = edge.get("source")
                         if source_id and source_id in kg_nodes:
-                            traversed_edges.append(edge)
+                            edge_key = (source_id, edge.get("target"), edge.get("relation"))
+                            if edge_key not in seen_edge_keys:
+                                traversed_edges.append(edge)
+                                seen_edge_keys.add(edge_key)
                             if source_id not in visited:
                                 visited.add(source_id)
                                 queue.append((source_id, current_depth + 1))
