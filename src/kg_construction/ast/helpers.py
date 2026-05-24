@@ -12,8 +12,8 @@ Organised into sections (in file order):
     - Call-site extraction              (_extract_callee_name, _extract_call_receiver,
                                          _collect_local_types)
     - Function/method metadata          (_get_docstring, _get_decorators, _get_signature,
-                                         _get_exceptions, _count_branches, _get_assert_patterns,
-                                         _get_return_types)
+                                         _get_exceptions, _extract_conditions, _extract_data_flows,
+                                         _count_branches, _get_assert_patterns, _get_return_types)
     - Class metadata                    (_get_base_names, _get_class_attributes,
                                          _get_instantiated_classes_in_class)
     - Function-body analysis            (_get_attribute_accesses, _get_used_imports,
@@ -319,6 +319,120 @@ def _extract_conditions(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> L
 
     _walk_no_nested(node)
     return conditions
+
+
+def _extract_data_flows(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Dict:
+    """Extract data flow information from a function body.
+
+    Identifies how data flows through the function:
+    - Return values flowing to callers
+    - Parameter usage patterns
+    - Attribute mutations on self
+
+    Returns a dict with keys:
+        returns: List of unparsed return value expressions
+        mutates_attributes: {attr_name: [list of value expressions assigned to it]}
+        parameter_usage: {param_name: [line numbers where it appears]}
+
+    Example:
+        def send(self, url, timeout=30):
+            if timeout < 0:
+                raise ValueError()
+            response = self._request(url)
+            self.cache[url] = response
+            return response
+
+        Returns:
+        {
+            'returns': ['response'],
+            'mutates_attributes': {'cache': ['self._request(url)']},
+            'parameter_usage': {'url': [4, 5], 'timeout': [3]}
+        }
+    """
+    flows = {
+        'returns': [],
+        'mutates_attributes': {},
+        'parameter_usage': {},
+    }
+
+    # Get parameter names for later lookup
+    param_names = set()
+    for arg in node.args.args + node.args.posonlyargs + node.args.kwonlyargs:
+        param_names.add(arg.arg)
+    if node.args.vararg:
+        param_names.add(node.args.vararg.arg)
+    if node.args.kwarg:
+        param_names.add(node.args.kwarg.arg)
+
+    # Walk function body (skip nested function defs for mutations, but track param usage in them)
+    def _walk_no_nested(n: ast.AST, allow_param_in_nested: bool = False) -> None:
+        """Recursively extract data flows.
+
+        Args:
+            n: AST node to walk
+            allow_param_in_nested: If True, we're inside a nested function and should track param usage
+        """
+        for child in ast.iter_child_nodes(n):
+            # For nested functions, extract param usage but skip mutations/returns
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                # Recursively walk nested function only for parameter usage (closures)
+                _walk_no_nested(child, allow_param_in_nested=True)
+                continue
+
+            # Track return values (only in direct scope, not nested functions)
+            if isinstance(child, ast.Return) and child.value and not allow_param_in_nested:
+                unparsed = _safe_unparse(child.value)
+                if unparsed:
+                    flows['returns'].append(unparsed)
+
+            # Track attribute mutations (only in direct scope, not nested functions):
+            # - Direct: self.x = value
+            # - Subscript: self.x[key] = value
+            elif isinstance(child, ast.Assign) and not allow_param_in_nested:
+                for target in child.targets:
+                    attr_name = None
+
+                    # Direct attribute: self.x = value
+                    if isinstance(target, ast.Attribute):
+                        if isinstance(target.value, ast.Name) and target.value.id == 'self':
+                            attr_name = target.attr
+
+                    # Subscript mutation: self.x[key] = value
+                    elif isinstance(target, ast.Subscript):
+                        if isinstance(target.value, ast.Attribute):
+                            if isinstance(target.value.value, ast.Name) and target.value.value.id == 'self':
+                                attr_name = target.value.attr
+
+                    if attr_name:
+                        if attr_name not in flows['mutates_attributes']:
+                            flows['mutates_attributes'][attr_name] = []
+                        value_unparsed = _safe_unparse(child.value)
+                        if value_unparsed:
+                            flows['mutates_attributes'][attr_name].append(value_unparsed)
+
+            # Track parameter usage (Name nodes in Load context)
+            elif isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                if child.id in param_names:
+                    param = child.id
+                    if param not in flows['parameter_usage']:
+                        flows['parameter_usage'][param] = []
+                    flows['parameter_usage'][param].append(child.lineno)
+
+            # Recurse
+            _walk_no_nested(child)
+
+    _walk_no_nested(node)
+
+    # Deduplicate and sort parameter usage lines
+    for param in flows['parameter_usage']:
+        flows['parameter_usage'][param] = sorted(list(set(flows['parameter_usage'][param])))
+
+    # Deduplicate return values and mutations
+    flows['returns'] = list(set(flows['returns']))
+    for attr in flows['mutates_attributes']:
+        flows['mutates_attributes'][attr] = list(set(flows['mutates_attributes'][attr]))
+
+    return flows
 
 
 def _count_branches(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> int:
@@ -742,6 +856,9 @@ def _build_func_metadata(
     # side_effects: attribute names written via self.*
     _, writes = _get_attribute_accesses(func_node, parent_class)
 
+    # data_flows: return values, mutations, parameter usage
+    data_flows = _extract_data_flows(func_node)
+
     meta: Dict = {
         'filepath': rel_path,
         'repo': repo,
@@ -755,6 +872,7 @@ def _build_func_metadata(
         'is_async': isinstance(func_node, ast.AsyncFunctionDef),
         'branches': _count_branches(func_node),
         'conditions': _extract_conditions(func_node),
+        'data_flows': data_flows,
         # Populated for anything in a test file — covers test functions and
         # their helper classes (e.g. DomDocument.get_unique_child in pytest).
         # Production code is skipped to avoid noise from invariant asserts.
