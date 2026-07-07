@@ -590,7 +590,21 @@ class RepoASTParser:
                 matches = class_label_to_ids.get(edge['target'], [])
                 if not matches:
                     continue
-                confidence = 'exact' if len(matches) == 1 else 'ambiguous'
+                # The uppercase-first-letter heuristic that produced this
+                # candidate name (_get_instantiated_classes) can't tell a
+                # constructor call from a call to an unrelated uppercase-named
+                # function/method that happens to share the name. If a
+                # function/method with this exact name also exists anywhere
+                # in the repo, the "instantiation" is only a guess even when
+                # a single class name matches, so confidence is downgraded
+                # to 'ambiguous' rather than reported as 'exact'.
+                name_collides_with_callable = edge['target'] in label_to_ids
+                if len(matches) > 1:
+                    confidence = 'ambiguous'
+                elif name_collides_with_callable:
+                    confidence = 'ambiguous'
+                else:
+                    confidence = 'exact'
                 for target_id in matches:
                     key = (edge['source'], target_id, 'uses')
                     if key not in seen_edges:
