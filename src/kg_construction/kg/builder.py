@@ -256,12 +256,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                          class_name: Optional[str] = None):
         """Emit semantic edges for a function or method beyond call relationships.
 
-        Complements _emit_call_edges with four additional edge types:
-            reads/writes:  self.attr accesses within the body, emitted as
-                           unresolved attribute name strings. Dropped in pass 2
-                           because attribute names are not graph nodes.
-            returns:       return type annotation (if present) plus inferred
-                           types from return statements. Also unresolved/dropped.
+        Complements _emit_call_edges with two additional edge types:
             depends_on:    imports actually referenced in the function body,
                            resolved directly to import node IDs at emit time
                            (no second pass needed — import nodes already exist).
@@ -269,26 +264,19 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                            edge keyed on the function's own name so pass 2 can
                            strip the 'test_' prefix and link to the target.
 
+        Note: reads/writes/returns are NOT emitted as edges — attribute and
+        type names aren't graph node IDs, so pass 2 (_resolve_edges) can
+        never resolve them and would just discard them. That information is
+        already captured as node metadata instead (side_effects, data_flows)
+        via _build_func_metadata.
+
         Args:
             func_id: Node ID of the function/method being processed.
             func_node: The AST function node.
-            class_name: Name of the enclosing class, passed through to
-                        _get_attribute_accesses for self.attr scoping.
+            class_name: Name of the enclosing class (unused now that
+                        reads/writes edges are gone; kept for signature
+                        compatibility with callers).
         """
-        # reads/writes: attribute accesses on self or other objects
-        reads, writes = _get_attribute_accesses(func_node, class_name)
-        for attr in reads:
-            edges.append(asdict(KGEdge(source=func_id, target=attr, relation='reads',
-                                       metadata={'unresolved': True})))
-        for attr in writes:
-            edges.append(asdict(KGEdge(source=func_id, target=attr, relation='writes',
-                                       metadata={'unresolved': True})))
-
-        # returns: return type annotations and inferred return expressions
-        for ret_type in _get_return_types(func_node):
-            edges.append(asdict(KGEdge(source=func_id, target=ret_type, relation='returns',
-                                       metadata={'unresolved': True})))
-
         # depends_on: imports actually used in this function body
         for qualified in _get_used_imports(func_node, import_map):
             imp_id = _make_id(f"import_{repo}_{qualified}")
