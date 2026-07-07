@@ -640,8 +640,11 @@ class RepoASTParser:
                     resolved_edges.append(edge)
 
         # Add module_depends_on edges
-        file_label_to_id: Dict[str, str] = {
-            n['label']: n['id'] for n in all_nodes
+        # Keyed by full relative path (e.g. 'pkg_a/utils.py'), not bare filename,
+        # so same-named files in different packages (pkg_a/utils.py vs
+        # pkg_b/utils.py) don't collide and misattribute the dependency edge.
+        file_path_to_id: Dict[str, str] = {
+            n['metadata'].get('path', ''): n['id'] for n in all_nodes
             if n['type'] in ('file', 'test_file')
         }
         import_to_files: Dict[str, List[str]] = defaultdict(list)
@@ -654,9 +657,13 @@ class RepoASTParser:
                 continue
             module = imp_node['metadata'].get('module', '')
             parts = (module or imp_node['label']).split('.')
-            for i in range(len(parts), 0, -1):
-                candidate = parts[i - 1] + '.py'
-                target_file_id = file_label_to_id.get(candidate)
+            # Try progressively shorter path suffixes: for 'pkg.sub.mod' try
+            # 'pkg/sub/mod.py', then 'sub/mod.py', then 'mod.py', matching
+            # against full file paths so identically-named files in different
+            # packages resolve to the correct one.
+            for i in range(len(parts)):
+                candidate = '/'.join(parts[i:]) + '.py'
+                target_file_id = file_path_to_id.get(candidate)
                 if target_file_id:
                     for src_file_id in import_to_files.get(imp_node['id'], []):
                         if src_file_id != target_file_id:
