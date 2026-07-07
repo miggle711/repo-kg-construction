@@ -8,6 +8,14 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+groq = ["groq"]
+anthropic = ["anthropic"]
+viz = ["pyvis"]
+datasets = ["datasets"]
+llm = ["kg-construction[groq,anthropic]"]
+all = ["kg-construction[llm,viz,datasets]"]
+
 [project.scripts]
 kg-run = "kg_construction.pipeline:main"
 
