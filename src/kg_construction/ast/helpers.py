@@ -114,20 +114,51 @@ def _extract_call_receiver(call: ast.Call) -> Optional[str]:
     return None
 
 
+def _annotated_param_types(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> Dict[str, str]:
+    """Map parameter names to their bare annotated type name, where unambiguous.
+
+    Only direct Name/Attribute annotations are used (e.g. `x: Request` or
+    `x: pkg.Request` -> 'Request'). Subscripted annotations like
+    `Optional[Request]` or `List[Request]` are skipped: the parameter could
+    be None or a container, so the "receiver is an instance of this type"
+    assumption that _collect_local_types relies on doesn't hold.
+    """
+    types: Dict[str, str] = {}
+    all_args = (
+        func_node.args.posonlyargs
+        + func_node.args.args
+        + func_node.args.kwonlyargs
+    )
+    for arg in all_args:
+        ann = arg.annotation
+        if isinstance(ann, ast.Name):
+            types[arg.arg] = ann.id
+        elif isinstance(ann, ast.Attribute):
+            types[arg.arg] = ann.attr
+    return types
+
+
 def _collect_local_types(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
 ) -> Dict[str, str]:
-    """Map local variable names to inferred class names from constructor calls.
+    """Map local variable names to inferred class names from constructor calls
+    and type-annotated parameters.
 
-    Walks assignments of the form `x = SomeClass(...)` and records {x: SomeClass}.
-    Heuristics: only direct constructor calls (capitalized name or attribute call
-    whose final part is capitalized). Reassignments overwrite earlier entries.
-    Nested function bodies are skipped — their locals belong to that scope.
+    Seeds the map from parameter annotations first (e.g. `def f(self, x: Request)`
+    -> {'x': 'Request'}), then walks assignments of the form `x = SomeClass(...)`
+    and records {x: SomeClass}, overwriting the annotation-derived entry if the
+    same name is reassigned to a constructor call. Heuristics for constructor
+    calls: only direct calls (capitalized name or attribute call whose final
+    part is capitalized). Nested function bodies are skipped for assignments —
+    their locals belong to that scope — but a nested function's own parameters
+    are not in scope here either way.
 
     Used to resolve attribute calls like `x.save()` to `SomeClass.save` when x's
-    type is known from a visible constructor call earlier in the function.
+    type is known from a visible constructor call or parameter annotation.
     """
-    types: Dict[str, str] = {}
+    types: Dict[str, str] = _annotated_param_types(func_node)
 
     def _walk(n: ast.AST):
         for child in ast.iter_child_nodes(n):
