@@ -7,8 +7,7 @@ Designed as a foundation for test generation using SWE-bench data.
 ## Quick Start
 
 ```bash
-pip install -e .
-pip install datasets pyvis  # optional: for datasets, visualizations
+pip install -e ".[all]"  # or just `.` for core-only, see Installation below
 python3 run.py
 ```
 
@@ -169,12 +168,16 @@ pytest tests/ -v
 ## Installation
 
 ```bash
-# Install the package in editable mode
+# Core install (KG building, extraction, validation — stdlib only)
 pip install -e .
 
-# Optional dependencies
-pip install datasets   # for datasets, run.py examples
-pip install pyvis      # for engine.visualize()
+# Optional extras, as needed:
+pip install -e ".[groq]"      # GroqTestGenerator
+pip install -e ".[anthropic]" # AnthropicTestGenerator
+pip install -e ".[llm]"       # both LLM backends
+pip install -e ".[viz]"       # engine.visualize() (pyvis)
+pip install -e ".[datasets]"  # SWE-bench dataset examples
+pip install -e ".[all]"       # everything
 ```
 
 Core functionality requires only Python 3.10+. No other dependencies beyond the standard library.
