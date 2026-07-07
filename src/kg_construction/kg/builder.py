@@ -535,6 +535,10 @@ class RepoASTParser:
 
         resolved_edges: List[Dict] = []
         seen_edges: Set[Tuple] = set()
+        # 'overrides' needs the fully-resolved 'inherits' graph to walk
+        # transitive base classes, so raw edges are collected here and
+        # resolved in a dedicated pass after this loop finishes.
+        pending_overrides: List[Dict] = []
 
         for edge in all_edges:
             meta = edge.get('metadata', {})
@@ -615,22 +619,11 @@ class RepoASTParser:
                         )))
 
             elif edge['relation'] == 'overrides' and meta.get('unresolved'):
-                parts = edge['target'].rsplit('.', 1)
-                if len(parts) != 2:
-                    continue
-                base_name, method_name = parts
-                base_simple = base_name.split('.')[-1]
-                if class_label_to_ids.get(base_simple):
-                    for target_id in label_to_ids.get(method_name, []):
-                        node = nodes_by_id.get(target_id, {})
-                        if node.get('metadata', {}).get('class') == base_simple:
-                            key = (edge['source'], target_id, 'overrides')
-                            if key not in seen_edges:
-                                seen_edges.add(key)
-                                resolved_edges.append(asdict(KGEdge(
-                                    source=edge['source'], target=target_id,
-                                    relation='overrides'
-                                )))
+                # Deferred: resolved in _resolve_overrides after 'inherits'
+                # edges are fully resolved, so the transitive base-class
+                # chain is walkable (a method can override a *grandparent's*
+                # definition, not just an immediate base's).
+                pending_overrides.append(edge)
 
             elif meta.get('unresolved'):
                 continue
@@ -640,6 +633,8 @@ class RepoASTParser:
                 if key not in seen_edges:
                     seen_edges.add(key)
                     resolved_edges.append(edge)
+
+        self._resolve_overrides(pending_overrides, resolved_edges, indices, seen_edges)
 
         # Add module_depends_on edges
         # Keyed by full relative path (e.g. 'pkg_a/utils.py'), not bare filename,
@@ -679,6 +674,95 @@ class RepoASTParser:
                     break
 
         return resolved_edges
+
+    def _resolve_overrides(
+        self,
+        pending_overrides: List[Dict],
+        resolved_edges: List[Dict],
+        indices: Dict,
+        seen_edges: Set[Tuple],
+    ) -> None:
+        """Resolve 'overrides' edges by walking the transitive inherits chain.
+
+        A method overrides the *nearest* ancestor that defines a method of
+        the same name — matching Python's actual MRO/lookup semantics. For
+        `class C(B)`, `class B(A)`, if only `A` defines `foo`, `C.foo`
+        overrides `A.foo` (B is skipped because it doesn't define foo). If
+        `B` also defines `foo`, `C.foo` overrides `B.foo` only, not both.
+
+        Requires 'inherits' edges to already be resolved (present in
+        resolved_edges) so the base-class graph can be walked by ID rather
+        than by name. Appends resolved 'overrides' edges directly onto
+        resolved_edges.
+
+        Args:
+            pending_overrides: Unresolved 'overrides' edges collected during
+                the main _resolve_edges loop, targets shaped 'BaseName.method'.
+            resolved_edges: The in-progress resolved edge list; mutated in
+                place to append newly resolved 'overrides' edges.
+            indices: Name->id lookup indices from _aggregate_and_index.
+            seen_edges: Shared dedup set of (source, target, relation) keys.
+        """
+        if not pending_overrides:
+            return
+
+        class_label_to_ids = indices['class_label_to_ids']
+        class_method_to_ids = indices['class_method_to_ids']
+        nodes_by_id = indices['nodes_by_id']
+
+        # Build class_id -> [base_class_id, ...] from the resolved inherits
+        # edges so the chain can be walked by ID (unambiguous), rather than
+        # re-deriving base names from strings for every ancestor level.
+        base_class_ids: Dict[str, List[str]] = defaultdict(list)
+        for edge in resolved_edges:
+            if edge['relation'] == 'inherits':
+                base_class_ids[edge['source']].append(edge['target'])
+
+        def _find_override_target(base_class_id: str, method_name: str) -> Optional[str]:
+            """BFS up the inheritance chain for the nearest method definition.
+
+            Returns the first matching method's node ID, or None if no
+            ancestor in the chain defines a method with this name. Tracks
+            visited classes to guard against cyclical/malformed inherits
+            edges (e.g. from ambiguous multi-match resolution).
+            """
+            visited: Set[str] = set()
+            frontier = [base_class_id]
+            while frontier:
+                next_frontier: List[str] = []
+                for class_id in frontier:
+                    if class_id in visited:
+                        continue
+                    visited.add(class_id)
+
+                    class_node = nodes_by_id.get(class_id)
+                    if class_node:
+                        hits = class_method_to_ids.get((class_node['label'], method_name), [])
+                        if hits:
+                            return hits[0]
+
+                    next_frontier.extend(base_class_ids.get(class_id, []))
+                frontier = next_frontier
+            return None
+
+        for edge in pending_overrides:
+            parts = edge['target'].rsplit('.', 1)
+            if len(parts) != 2:
+                continue
+            base_name, method_name = parts
+            base_simple = base_name.split('.')[-1]
+
+            for base_class_id in class_label_to_ids.get(base_simple, []):
+                target_id = _find_override_target(base_class_id, method_name)
+                if target_id is None:
+                    continue
+                key = (edge['source'], target_id, 'overrides')
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    resolved_edges.append(asdict(KGEdge(
+                        source=edge['source'], target=target_id,
+                        relation='overrides'
+                    )))
 
     def _add_call_context(self, all_nodes: List[Dict], all_edges: List[Dict]) -> None:
         """Annotate functions with caller_count and direct_callers metadata."""
