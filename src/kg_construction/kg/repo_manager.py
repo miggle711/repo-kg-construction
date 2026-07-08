@@ -53,12 +53,23 @@ class RepoManager:
             )
         return path
 
+    def _archive(self, repo_path: Path, commit: str, archive_path: Path):
+        subprocess.run(
+            ['git', '--git-dir', str(repo_path), 'archive',
+             '--format=tar', '--output', str(archive_path), commit],
+            check=True, timeout=GIT_TIMEOUT
+        )
+
     def extract_at_commit(self, repo: str, commit: str, dest: Path):
         """Extract the repo source tree at a specific commit into dest.
 
         Uses git archive rather than git checkout to avoid modifying the
         cached clone or creating a working tree. The tar is extracted then
         deleted, leaving only the source files in dest.
+
+        If the commit isn't found in an already-cached bare clone (e.g. the
+        clone predates the commit landing on the remote), fetches once and
+        retries before surfacing an error.
 
         Args:
             repo: GitHub repo in 'owner/name' format.
@@ -68,11 +79,20 @@ class RepoManager:
         repo_path = self.ensure_clone(repo)
         dest.mkdir(parents=True, exist_ok=True)
         archive_path = dest / '_archive.tar'
-        subprocess.run(
-            ['git', '--git-dir', str(repo_path), 'archive',
-             '--format=tar', '--output', str(archive_path), commit],
-            check=True, timeout=GIT_TIMEOUT
-        )
+        try:
+            self._archive(repo_path, commit, archive_path)
+        except subprocess.CalledProcessError:
+            subprocess.run(
+                ['git', '--git-dir', str(repo_path), 'fetch', 'origin'],
+                check=True, timeout=GIT_TIMEOUT
+            )
+            try:
+                self._archive(repo_path, commit, archive_path)
+            except subprocess.CalledProcessError as e:
+                raise ValueError(
+                    f"Commit '{commit}' not found in {repo} after fetching "
+                    f"origin. Verify the commit SHA is correct and reachable."
+                ) from e
         with tarfile.open(archive_path) as tar:
             # filter='data' prevents path traversal attacks from malicious tarballs
             tar.extractall(dest, filter='data')
