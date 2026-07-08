@@ -2,6 +2,8 @@
 run.py
 
 Generic KG builder + subgraph extractor + validator.
+Test generation itself lives outside this repo (see kg-test-generation),
+which consumes the hierarchical JSON produced by serialize_context().
 
 Supports multiple input modes:
   1. Interactive (default): prompts for repo, commit, patch file, code_file, test_file
@@ -34,7 +36,6 @@ from kg_construction.extraction.context import TestContextExtractor
 from kg_construction.extraction.validator import TestContextValidator
 from kg_construction.kg.validator import KGValidator
 from kg_construction.llm.llm_serializer import LLMSerializer
-from kg_construction.llm.groq import GroqTestGenerator
 
 
 def _load_or_build(builder, repo, commit):
@@ -51,7 +52,29 @@ def _load_or_build(builder, repo, commit):
         return kg
 
 
-def extract_and_validate(instance, depth=2, verbose=True, generate_tests=False):
+def serialize_context(context):
+    """Serialize a TestContext into hierarchical JSON for LLM consumption.
+
+    Args:
+        context: TestContext object (e.g. returned by extract_and_validate)
+
+    Returns:
+        Hierarchical JSON dict ({seed, context, instructions}) suitable for
+        passing to an LLM-based test generator.
+    """
+    serializer = LLMSerializer(repo=context.repo)
+    context_dict = {
+        'repo': context.repo,
+        'base_commit': context.base_commit,
+        'seeds': context.seeds,
+        'context_nodes': context.context_nodes,
+        'edges': context.edges,
+        'test_nodes': context.test_nodes,
+    }
+    return serializer.serialize(context_dict)
+
+
+def extract_and_validate(instance, depth=2, verbose=True):
     """Extract and validate a subgraph from an instance dict.
 
     This is the core function that works with any patch source (dataset,
@@ -66,16 +89,11 @@ def extract_and_validate(instance, depth=2, verbose=True, generate_tests=False):
             - test_file: Relative path to test file
         depth: BFS depth for subgraph extraction (default 2)
         verbose: Print progress messages (default True)
-        generate_tests: If True, generate tests using Groq API (Phase 5)
 
     Returns:
-        If generate_tests=False:
-            (context, report) where:
-            - context: TestContext object (can be saved with context.save())
-            - report: Validation report string (errors + warnings)
-        If generate_tests=True:
-            (context, report, generated_tests) where:
-            - generated_tests: Generated test code as string
+        (context, report) where:
+        - context: TestContext object (can be saved with context.save())
+        - report: Validation report string (errors + warnings)
 
     Raises:
         ValueError: If code_file not found in KG or other extraction errors
@@ -118,53 +136,13 @@ def extract_and_validate(instance, depth=2, verbose=True, generate_tests=False):
     if verbose:
         print(report)
 
-    # Phase 5: Generate tests if requested (only if subgraph validation passed)
-    generated_tests = None
-    test_generation_error = None
-    if generate_tests and is_valid:
-        if verbose:
-            print("Phase 5: Generating tests with Groq...", end=" ", flush=True)
-        try:
-            # Serialize to hierarchical JSON
-            serializer = LLMSerializer(repo=repo)
-            context_dict = {
-                'repo': context.repo,
-                'base_commit': context.base_commit,
-                'seeds': context.seeds,
-                'context_nodes': context.context_nodes,
-                'edges': context.edges,
-                'test_nodes': context.test_nodes,
-            }
-            hierarchical_json = serializer.serialize(context_dict)
-
-            # Generate tests
-            generator = GroqTestGenerator()
-            generated_tests = generator.generate(hierarchical_json)
-            if verbose:
-                print("✓")
-        except Exception as e:
-            test_generation_error = str(e)
-            if verbose:
-                print(f"\n✗ Test generation failed: {e}")
-    elif generate_tests and not is_valid:
-        test_generation_error = "Skipped: subgraph validation failed (has blocking errors)"
-        if verbose:
-            print(f"⊘ Phase 5 skipped: {test_generation_error}")
-
-    if generate_tests:
-        # Append test generation error to report if one occurred
-        full_report = report
-        if test_generation_error:
-            full_report += f"\n\nPhase 5 (Test Generation): {test_generation_error}"
-        return context, full_report, generated_tests
-    else:
-        return context, report
+    return context, report
 
 
 def _interactive_mode():
     """Interactive mode: prompt for inputs."""
     print("=" * 70)
-    print("KG Builder + Subgraph Extractor + Validator + Test Generator (Phase 5)")
+    print("KG Builder + Subgraph Extractor + Validator")
     print("=" * 70)
 
     repo = input("\nRepo (e.g. psf/requests): ").strip()
@@ -172,7 +150,6 @@ def _interactive_mode():
     patch_path = input("Path to patch file: ").strip()
     code_file = input("Code file (e.g. requests/sessions.py): ").strip()
     test_file = input("Test file (e.g. tests/test_sessions.py): ").strip()
-    generate = input("Generate tests with Groq? (y/n, default: n): ").strip().lower() == 'y'
 
     patch = Path(patch_path).read_text()
 
@@ -184,25 +161,13 @@ def _interactive_mode():
         'test_file': test_file,
     }
 
-    result = extract_and_validate(instance, depth=2, verbose=True, generate_tests=generate)
-
-    if generate:
-        context, report, generated_tests = result
-    else:
-        context, report = result
-        generated_tests = None
+    context, report = extract_and_validate(instance, depth=2, verbose=True)
 
     # Save subgraph
     repo_slug = repo.replace('/', '_')
     out_path = f"kg_output/{repo_slug}_{commit[:8]}_subgraph.json"
     context.save(out_path)
     print(f"✓ Saved subgraph to {out_path}")
-
-    # Save generated tests if available
-    if generated_tests:
-        test_out_path = f"kg_output/{repo_slug}_{commit[:8]}_generated_tests.py"
-        Path(test_out_path).write_text(generated_tests)
-        print(f"✓ Saved generated tests to {test_out_path}")
 
 
 def main():
