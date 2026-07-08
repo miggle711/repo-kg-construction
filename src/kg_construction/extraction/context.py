@@ -159,7 +159,7 @@ class TestContextExtractor:
         """
         if edge_filter is None:
             # Exclude depends_on (imports) as noise; include structural edges only
-            edge_filter = {'contains', 'calls', 'inherits', 'tests', 'uses'}
+            edge_filter = {'contains', 'calls', 'accesses', 'inherits', 'tests', 'uses'}
 
         # Extract changed function/class names from the patch
         changed_names = self.patch_parser.extract_changed_functions(

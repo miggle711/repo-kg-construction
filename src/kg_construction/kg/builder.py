@@ -8,8 +8,8 @@ Given a GitHub repo and a commit SHA, this module:
   2. Extracts the source tree at that commit via git archive
   3. Parses every .py file with Python's ast module in parallel
   4. Emits nodes (file, class, function, method, test_function, import) and
-     edges (contains, imports, calls, inherits, tests, uses, overrides,
-     depends_on, module_depends_on) into a JSON KG
+     edges (contains, imports, calls, accesses, inherits, tests, uses,
+     overrides, depends_on, module_depends_on) into a JSON KG
 
 Node metadata includes: signatures, type annotations, default values,
 decorators, docstrings, raised/caught exceptions, branch counts,
@@ -58,6 +58,7 @@ from kg_construction.ast.helpers import (
     _safe_unparse,
     _extract_callee_name,
     _extract_call_receiver,
+    _extract_property_accesses,
     _collect_local_types,
     _get_docstring,
     _get_decorators,
@@ -116,6 +117,7 @@ class KGEdge:
             - 'contains': file→class, file→function, class→method
             - 'imports':  file→import module
             - 'calls':    function/method→function/method (best-effort static analysis)
+            - 'accesses': function/method→@property method (attribute reads, no call syntax)
             - 'inherits': class→parent class
         metadata: Edge-specific data, e.g. confidence ('exact'/'ambiguous') for
                   calls and inherits edges resolved in the second pass.
@@ -252,6 +254,50 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 }
             )))
 
+    def _emit_access_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+                           class_name: Optional[str] = None):
+        """Emit one 'accesses' edge per unique (caller, attr_name) pair.
+
+        Covers @property reads (obj.attr, never obj.attr()) that
+        _emit_call_edges has no signal for at all, since a property access
+        never appears as an ast.Call node. Edges are marked unresolved=True;
+        pass 2 resolves them against an index of @property-decorated
+        methods (built the same way class_method_to_ids is, filtered to
+        nodes whose decorators include 'property').
+
+        Uses the same hint shape as 'calls' edges (class_hint,
+        local_type_hint, import_resolved, receiver) so pass-2 resolution
+        can share the same disambiguation logic.
+        """
+        local_types = _collect_local_types(func_node)
+        seen_access_targets: Set[Tuple[str, str]] = set()
+        for attr_name, receiver in _extract_property_accesses(func_node):
+            if (func_id, attr_name) in seen_access_targets:
+                continue
+            seen_access_targets.add((func_id, attr_name))
+
+            class_hint: Optional[str] = None
+            local_type_hint: Optional[str] = None
+            import_resolved: Optional[str] = None
+
+            if receiver == 'self' and class_name is not None:
+                class_hint = class_name
+            elif receiver and receiver in local_types:
+                local_type_hint = local_types[receiver]
+            elif receiver and receiver in import_map:
+                import_resolved = f"{import_map[receiver]}.{attr_name}"
+
+            edges.append(asdict(KGEdge(
+                source=func_id, target=attr_name, relation='accesses',
+                metadata={
+                    'unresolved': True,
+                    'receiver': receiver,
+                    'class_hint': class_hint,
+                    'local_type_hint': local_type_hint,
+                    'import_resolved': import_resolved,
+                }
+            )))
+
     def _emit_func_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
                          class_name: Optional[str] = None):
         """Emit semantic edges for a function or method beyond call relationships.
@@ -338,6 +384,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                                 metadata={'unresolved': True}
                             )))
                     _emit_call_edges(func_id, child, class_name=node.name)
+                    _emit_access_edges(func_id, child, class_name=node.name)
                     _emit_func_edges(func_id, child, class_name=node.name)
 
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -349,6 +396,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             )))
             edges.append(asdict(KGEdge(source=file_id, target=func_id, relation='contains')))
             _emit_call_edges(func_id, node)
+            _emit_access_edges(func_id, node)
             _emit_func_edges(func_id, node)
 
     return {'nodes': nodes, 'edges': edges}
@@ -480,10 +528,21 @@ class RepoASTParser:
         nodes_by_id: Dict[str, Dict] = {n['id']: n for n in all_nodes}
         all_edges: List[Dict] = [edge for result in results for edge in result['edges']]
 
+        # Derived from class_method_to_ids (no extra AST walk needed): the
+        # same index, filtered to @property-decorated methods only, so
+        # 'accesses' edge resolution can't accidentally link a property
+        # read to a same-named plain method.
+        property_method_to_ids: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        for (class_label, method_label), ids in class_method_to_ids.items():
+            for node_id in ids:
+                if 'property' in nodes_by_id[node_id]['metadata'].get('decorators', []):
+                    property_method_to_ids[(class_label, method_label)].append(node_id)
+
         indices = {
             'label_to_ids': label_to_ids,
             'class_label_to_ids': class_label_to_ids,
             'class_method_to_ids': class_method_to_ids,
+            'property_method_to_ids': property_method_to_ids,
             'qualified_to_ids': qualified_to_ids,
             'nodes_by_id': nodes_by_id,
         }
@@ -493,15 +552,47 @@ class RepoASTParser:
     def _resolve_edges(self, all_nodes: List[Dict], all_edges: List[Dict], indices: Dict) -> List[Dict]:
         """Resolve unresolved edges using name→id indices.
 
-        Processes 'calls', 'inherits', 'tests', 'uses', 'overrides' edges.
+        Processes 'calls', 'accesses', 'inherits', 'tests', 'uses',
+        'overrides' edges.
         Drops reads/writes/returns edges (attribute strings, not node IDs).
         Returns resolved edge list.
         """
         label_to_ids = indices['label_to_ids']
         class_label_to_ids = indices['class_label_to_ids']
         class_method_to_ids = indices['class_method_to_ids']
+        property_method_to_ids = indices['property_method_to_ids']
         qualified_to_ids = indices['qualified_to_ids']
         nodes_by_id = indices['nodes_by_id']
+
+        def _resolve_access(meta: Dict, attr_name: str) -> Tuple[List[str], str]:
+            """Resolve an accesses-edge target against known @property methods.
+
+            Unlike _resolve_call, there is no bare-name fallback against
+            label_to_ids: an unqualified property access with no receiver
+            hint is too weak a signal to link against every same-named
+            property in the repo, so it is left unresolved instead.
+            """
+            class_hint = meta.get('class_hint')
+            if class_hint:
+                hits = property_method_to_ids.get((class_hint, attr_name), [])
+                if hits:
+                    return hits, 'qualified'
+
+            local_hint = meta.get('local_type_hint')
+            if local_hint:
+                hits = property_method_to_ids.get((local_hint, attr_name), [])
+                if hits:
+                    return hits, 'qualified'
+
+            qualified = meta.get('import_resolved')
+            if qualified:
+                parts = qualified.rsplit('.', 2)
+                if len(parts) == 3:
+                    hits = property_method_to_ids.get((parts[1], parts[2]), [])
+                    if hits:
+                        return hits, 'qualified'
+
+            return [], 'unresolved'
 
         def _resolve_call(meta: Dict, callee_name: str) -> Tuple[List[str], str]:
             """Resolve a call-edge target using the metadata hints."""
@@ -556,6 +647,20 @@ class RepoASTParser:
                             source=edge['source'], target=target_id, relation='calls',
                             metadata={'confidence': confidence,
                                       'import_resolved': meta.get('import_resolved')}
+                        )))
+
+            elif edge['relation'] == 'accesses' and meta.get('unresolved'):
+                attr_name = edge['target']
+                matches, confidence = _resolve_access(meta, attr_name)
+                if not matches:
+                    continue
+                for target_id in matches:
+                    key = (edge['source'], target_id, 'accesses')
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        resolved_edges.append(asdict(KGEdge(
+                            source=edge['source'], target=target_id, relation='accesses',
+                            metadata={'confidence': confidence}
                         )))
 
             elif edge['relation'] == 'inherits' and meta.get('unresolved'):

@@ -94,11 +94,12 @@ class KGValidator(ValidationBase):
     def _check_cycles(self) -> None:
         """Detect cycles in dependency graph using DFS.
 
-        Only checks edges: calls, inherits, uses, overrides, module_depends_on.
-        Excludes 'contains' (parent-child, not circular), 'tests' (orthogonal),
-        'depends_on' and 'imports' (allowed to form cycles, resolved at runtime).
+        Only checks edges: calls, accesses, inherits, uses, overrides,
+        module_depends_on. Excludes 'contains' (parent-child, not circular),
+        'tests' (orthogonal), 'depends_on' and 'imports' (allowed to form
+        cycles, resolved at runtime).
         """
-        dep_relations = {'calls', 'inherits', 'uses', 'overrides', 'module_depends_on'}
+        dep_relations = {'calls', 'accesses', 'inherits', 'uses', 'overrides', 'module_depends_on'}
 
         # Build adjacency list for dependency edges
         dep_graph: Dict[str, List[str]] = defaultdict(list)

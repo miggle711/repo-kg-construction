@@ -10,7 +10,7 @@ Organised into sections (in file order):
     - Identity & path helpers           (_make_id, _is_test_file)
     - AST unparsing                     (_safe_unparse)
     - Call-site extraction              (_extract_callee_name, _extract_call_receiver,
-                                         _collect_local_types)
+                                         _extract_property_accesses, _collect_local_types)
     - Function/method metadata          (_get_docstring, _get_decorators, _get_signature,
                                          _get_exceptions, _extract_conditions, _extract_data_flows,
                                          _count_branches, _get_assert_patterns, _get_return_types)
@@ -138,6 +138,55 @@ def _annotated_param_types(
         elif isinstance(ann, ast.Attribute):
             types[arg.arg] = ann.attr
     return types
+
+
+def _extract_property_accesses(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> List[Tuple[str, Optional[str]]]:
+    """Find genuine (non-call) attribute reads: `obj.attr`, not `obj.attr()`.
+
+    A @property-decorated method is invoked as `obj.attr`, never
+    `obj.attr()` -- it never appears as an ast.Call node, so
+    _extract_callee_name/_emit_call_edges have zero signal for it. This
+    walks Attribute nodes directly and excludes:
+      - Attribute nodes that are the .func of an enclosing Call (already
+        covered by 'calls' edge extraction -- obj.method() is a call, not
+        a property access)
+      - Attribute nodes in Store/Del context (assignment targets, e.g.
+        `obj.attr = x` -- a write, not a read)
+      - Nested function scopes (their accesses belong to that scope)
+
+    Returns a deduplicated list of (attr_name, receiver) pairs, e.g.
+    `self.headers` -> ('headers', 'self'), `session.cookies` ->
+    ('cookies', 'session'). receiver is None if _safe_unparse fails.
+    """
+    accesses: List[Tuple[str, Optional[str]]] = []
+    seen: Set[Tuple[str, Optional[str]]] = set()
+    call_funcs: Set[int] = set()
+
+    def _collect_call_funcs(n: ast.AST):
+        for child in ast.walk(n):
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                call_funcs.add(id(child.func))
+
+    _collect_call_funcs(func_node)
+
+    def _walk_no_nested(n: ast.AST):
+        for child in ast.iter_child_nodes(n):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue  # nested fn -- its accesses belong to that scope
+            if (isinstance(child, ast.Attribute)
+                    and isinstance(child.ctx, ast.Load)
+                    and id(child) not in call_funcs):
+                receiver = _safe_unparse(child.value)
+                key = (child.attr, receiver)
+                if key not in seen:
+                    seen.add(key)
+                    accesses.append(key)
+            _walk_no_nested(child)
+
+    _walk_no_nested(func_node)
+    return accesses
 
 
 def _collect_local_types(

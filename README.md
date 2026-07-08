@@ -103,7 +103,8 @@ tests/
 |----------|---------|
 | `contains` | File/class contains a class, function, or method |
 | `imports` | File imports a module or name |
-| `calls` | Function calls another function (confidence: `exact`/`ambiguous`) |
+| `calls` | Function calls another function (confidence: `exact`/`ambiguous`/`qualified`) |
+| `accesses` | Function reads an `@property`-decorated attribute (no call syntax; confidence: `qualified`) |
 | `inherits` | Class inherits from another class |
 | `tests` | Test function targets a specific function |
 | `uses` | Class instantiates another class |
