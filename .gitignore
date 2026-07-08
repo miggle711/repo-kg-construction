@@ -1,6 +1,9 @@
 # my-docs
 my-docs/
 
+# paper content, kept local-only
+docs/PAPER.md
+
 # scripts
 scripts/
 
