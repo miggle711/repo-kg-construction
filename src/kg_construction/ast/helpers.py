@@ -819,6 +819,66 @@ def _get_instantiated_classes(
     return classes
 
 
+def _get_factory_call_sites(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+) -> List[Tuple[int, int]]:
+    """Find variable assignments from lowercase-named calls (candidate factories).
+
+    Detects patterns like `x = some_call(...)` and `self.x = some_call(...)`
+    where the callee name does NOT start with an uppercase letter — the exact
+    complement of the heuristic in _get_instantiated_classes(), which only
+    catches uppercase (PEP 8 class convention) callees. A lowercase callee
+    returning a class instance (e.g. `self.session = requests.session()`) is
+    invisible to that heuristic; this function instead records the
+    assignment's source location so an external type checker (see
+    kg/type_inference.py) can be asked what type the right-hand side
+    actually evaluates to.
+
+    Only simple `Name` targets (`x = ...`) and simple `self.<attr>`
+    targets (`self.x = ...`) are recorded (matching the restriction
+    _collect_local_types uses for the `Name` case); tuple targets and
+    attribute chains deeper than one level are skipped since they don't
+    reduce to a single (line, col) an editor-style hover query resolves
+    cleanly.
+
+    Returns:
+        List of (lineno, col_offset) tuples, one per candidate assignment
+        target, 0-indexed line/col ready for an LSP-style position query
+        (ast reports 1-indexed lines, converted here). For `self.x = ...`
+        the position points at the attribute name `x`, not `self`.
+    """
+    sites: List[Tuple[int, int]] = []
+
+    def _walk(n: ast.AST):
+        for child in ast.iter_child_nodes(n):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue  # nested fn — its locals belong to that scope
+            if isinstance(child, ast.Assign) and isinstance(child.value, ast.Call):
+                call = child.value
+                callee_name: Optional[str] = None
+                if isinstance(call.func, ast.Name):
+                    callee_name = call.func.id
+                elif isinstance(call.func, ast.Attribute):
+                    callee_name = call.func.attr
+                if callee_name and not callee_name[0].isupper():
+                    for target in child.targets:
+                        if isinstance(target, ast.Name):
+                            sites.append((target.lineno - 1, target.col_offset))
+                        elif (
+                            isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == 'self'
+                        ):
+                            # Position the query at the attribute name itself
+                            # (e.g. the 's' in 'self.s'), not at 'self'.
+                            attr_col = target.end_col_offset - len(target.attr)
+                            sites.append((target.lineno - 1, attr_col))
+            _walk(child)
+
+    _walk(func_node)
+    return sites
+
+
 # ---------------------------------------------------------------------------
 # Test-target inference
 # ---------------------------------------------------------------------------
