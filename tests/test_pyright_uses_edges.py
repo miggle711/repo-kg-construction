@@ -159,6 +159,67 @@ class TestPyrightUsesEdgeNonSelfReceiver:
         assert uses_edges[0]["metadata"]["source"] == "pyright"
 
     @pyright_required
+    def test_uses_edge_source_ignores_later_reassignment(self, tmp_path):
+        """Regression test for issue #31: a later reassignment of the
+        receiver must not override the type it held at the factory-call
+        site (previously, _collect_local_types' whole-function, last-write-
+        wins summary caused this site to be misattributed to whatever class
+        the receiver was reassigned to, anywhere in the function).
+        """
+        (tmp_path / "parsers.py").write_text(
+            "class Parser:\n"
+            "    def __init__(self):\n"
+            "        self.rules = []\n"
+            "\n"
+            "\n"
+            "def build_parser():\n"
+            "    return Parser()\n"
+        )
+        (tmp_path / "config.py").write_text(
+            "class Config:\n"
+            "    pass\n"
+            "\n"
+            "\n"
+            "class SomeUnrelatedClass:\n"
+            "    pass\n"
+        )
+        (tmp_path / "setup.py").write_text(
+            "from config import Config, SomeUnrelatedClass\n"
+            "from parsers import build_parser\n"
+            "\n"
+            "\n"
+            "def configure(config: Config):\n"
+            "    config.parser = build_parser()\n"
+            "    config = SomeUnrelatedClass()\n"
+        )
+        parser = RepoASTParser(max_workers=1, infer_types=True)
+        kg = parser.parse_repo("test/repo", tmp_path)
+
+        config_id = next(
+            n["id"] for n in kg["nodes"]
+            if n["type"] == "class" and n["label"] == "Config"
+        )
+        unrelated_id = next(
+            n["id"] for n in kg["nodes"]
+            if n["type"] == "class" and n["label"] == "SomeUnrelatedClass"
+        )
+        parser_id = next(
+            n["id"] for n in kg["nodes"]
+            if n["type"] == "class" and n["label"] == "Parser"
+        )
+
+        uses_edges = [e for e in kg["edges"] if e["relation"] == "uses"]
+
+        assert any(
+            e["source"] == config_id and e["target"] == parser_id
+            for e in uses_edges
+        ), "uses edge must be attributed to Config (the type at the call site)"
+        assert not any(
+            e["source"] == unrelated_id and e["target"] == parser_id
+            for e in uses_edges
+        ), "uses edge must NOT be attributed to SomeUnrelatedClass (a later reassignment)"
+
+    @pyright_required
     def test_no_edge_when_receiver_type_unresolvable(self, tmp_path):
         """other.attr = factory() where other's type can't be determined
         (no annotation, no prior constructor call) must not produce an edge
