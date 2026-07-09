@@ -10,7 +10,8 @@ dependencies = []
 
 [project.optional-dependencies]
 datasets = ["datasets"]
-all = ["kg-construction[datasets]"]
+types = ["pyright"]
+all = ["kg-construction[datasets,types]"]
 
 [project.scripts]
 kg-run = "kg_construction.pipeline:main"
