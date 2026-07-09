@@ -73,11 +73,13 @@ from kg_construction.ast.helpers import (
     _get_attribute_accesses,
     _get_used_imports,
     _get_instantiated_classes,
+    _get_factory_call_sites,
     _get_test_target,
     _build_func_metadata,
     _collect_file_level_info,
 )
 from kg_construction.kg.repo_manager import RepoManager
+from kg_construction.kg import type_inference
 
 
 # Directories to skip during repo traversal — typically non-source content
@@ -146,8 +148,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             abs_path: absolute path on disk in the temp extract directory
 
     Returns:
-        Dict with 'nodes' and 'edges' lists, or None if the file should be
-        skipped (unreadable, over line limit, or has a SyntaxError).
+        Dict with 'nodes', 'edges', and 'factory_sites' lists, or None if the
+        file should be skipped (unreadable, over line limit, or has a
+        SyntaxError). 'factory_sites' is a list of (rel_path, class_id, line,
+        col) tuples recording lowercase-callee assignment sites invisible to
+        the uppercase-heuristic 'uses' edges — see _get_factory_call_sites
+        and kg/type_inference.py for how these are optionally resolved.
 
     Node types emitted: file/test_file, import, class, function/method/test_function
     Edge types emitted: contains, imports, calls (unresolved — resolved in second pass)
@@ -171,6 +177,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     # Deduplicate call edges within this file at creation time to avoid
     # accumulating one edge per call-site for frequently called functions
     seen_call_targets: Set[Tuple[str, str]] = set()
+    # Factory-call assignment sites recorded per class, for optional pyright
+    # type resolution (see kg/type_inference.py). Only populated for methods,
+    # matching the existing class-level-only shape of 'uses' edges emitted
+    # via _get_instantiated_classes_in_class below.
+    factory_sites_by_class: Dict[str, List[Tuple[int, int]]] = {}
 
     file_id = _make_id(f"file_{repo}_{rel_path}")
     file_type = 'test_file' if _is_test_file(rel_path) else 'file'
@@ -387,6 +398,10 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     _emit_access_edges(func_id, child, class_name=node.name)
                     _emit_func_edges(func_id, child, class_name=node.name)
 
+                    factory_sites = _get_factory_call_sites(child)
+                    if factory_sites:
+                        factory_sites_by_class.setdefault(class_id, []).extend(factory_sites)
+
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             func_type = 'test_function' if node.name.startswith('test_') else 'function'
             func_id = _make_id(f"func_{repo}_{rel_path}_{node.name}")
@@ -399,7 +414,13 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             _emit_access_edges(func_id, node)
             _emit_func_edges(func_id, node)
 
-    return {'nodes': nodes, 'edges': edges}
+    factory_sites = [
+        (rel_path, class_id, line, col)
+        for class_id, sites in factory_sites_by_class.items()
+        for line, col in sites
+    ]
+
+    return {'nodes': nodes, 'edges': edges, 'factory_sites': factory_sites}
 
 
 # ---------------------------------------------------------------------------
@@ -421,20 +442,35 @@ class RepoASTParser:
         - Calls to external libraries (no match in repo) are dropped
     """
 
-    def __init__(self, max_workers: int = 4):
+    def __init__(self, max_workers: int = 4, infer_types: bool = False):
         """
         Args:
             max_workers: Number of parallel worker processes for file parsing.
                          Set to 1 for debugging to get synchronous tracebacks.
+            infer_types: If True, run an additional pyright-backed resolution
+                         pass (Pass 1.5) to catch 'uses' edges from lowercase
+                         factory-function calls that the uppercase heuristic
+                         can't see (e.g. `session = requests.session()`). See
+                         kg/type_inference.py. Off by default: requires the
+                         optional `pyright` dependency and adds a per-repo
+                         subprocess cost; failures degrade gracefully to
+                         "no enrichment" either way, so this never breaks a
+                         build even if pyright is missing or crashes.
         """
         self.max_workers = max_workers
+        self.infer_types = infer_types
 
     def parse_repo(self, repo: str, repo_dir: Path) -> Dict:
         """Walk repo_dir, parse all .py files in parallel, and return the KG dict.
 
-        Two-pass algorithm:
+        Two-pass algorithm (plus an optional Pass 1.5, see infer_types):
             Pass 1 (parallel): Each file parsed independently, emitting nodes
                 and unresolved call/inherits edges (targets as name strings).
+            Pass 1.5 (sequential, optional): If infer_types=True, resolve
+                factory-call sites recorded in Pass 1 via pyright and inject
+                the results as additional unresolved 'uses' edges, using the
+                exact same candidate-name shape the uppercase heuristic
+                produces so Pass 2 needs no special-casing for them.
             Pass 2 (sequential): Aggregate nodes, build name→id indices,
                 resolve edges, add call context.
 
@@ -447,6 +483,10 @@ class RepoASTParser:
         """
         file_args = self._collect_files(repo, repo_dir)
         results = self._run_parallel_parse(file_args)
+
+        if self.infer_types:
+            self._inject_inferred_uses_edges(results, repo_dir)
+
         all_nodes, all_edges, indices = self._aggregate_and_index(results)
         all_edges = self._resolve_edges(all_nodes, all_edges, indices)
         self._add_call_context(all_nodes, all_edges)
@@ -460,6 +500,37 @@ class RepoASTParser:
                 'parse_mode': 'source',
             }
         }
+
+    def _inject_inferred_uses_edges(self, results: List[Dict], repo_dir: Path) -> None:
+        """Resolve recorded factory-call sites via pyright and add 'uses' edges.
+
+        Mutates each result's 'edges' list in place, appending one unresolved
+        'uses' edge per successfully resolved site — same shape
+        (source=class_id, target=<type name string>, unresolved=True) as the
+        edges _get_instantiated_classes_in_class already produces, so no
+        changes are needed in _resolve_edges to consume them. Sites that
+        pyright can't resolve (unions, unknown, external types with no repo
+        class) are simply skipped — no edge is added, same as if the site
+        had never been recorded at all.
+        """
+        sites_by_file: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+        site_index: Dict[Tuple[str, int, int], Tuple[Dict, str]] = {}
+
+        for result in results:
+            for rel_path, class_id, line, col in result.get('factory_sites', []):
+                sites_by_file[rel_path].append((line, col))
+                site_index[(rel_path, line, col)] = (result, class_id)
+
+        if not sites_by_file:
+            return
+
+        resolved = type_inference.resolve_types(repo_dir, dict(sites_by_file))
+        for (rel_path, line, col), type_name in resolved.items():
+            result, class_id = site_index[(rel_path, line, col)]
+            result['edges'].append(asdict(KGEdge(
+                source=class_id, target=type_name, relation='uses',
+                metadata={'unresolved': True, 'source': 'pyright'}
+            )))
 
     def _collect_files(self, repo: str, repo_dir: Path) -> List[Tuple[str, str, str]]:
         """Collect all Python files to parse, excluding SKIP_DIRS.
@@ -714,13 +785,16 @@ class RepoASTParser:
                     confidence = 'ambiguous'
                 else:
                     confidence = 'exact'
+                edge_metadata = {'confidence': confidence}
+                if meta.get('source') == 'pyright':
+                    edge_metadata['source'] = 'pyright'
                 for target_id in matches:
                     key = (edge['source'], target_id, 'uses')
                     if key not in seen_edges:
                         seen_edges.add(key)
                         resolved_edges.append(asdict(KGEdge(
                             source=edge['source'], target=target_id, relation='uses',
-                            metadata={'confidence': confidence}
+                            metadata=edge_metadata
                         )))
 
             elif edge['relation'] == 'overrides' and meta.get('unresolved'):
@@ -924,17 +998,23 @@ class RepoKGBuilder:
     def __init__(self,
                  output_dir: Path = Path('kg_output'),
                  cache_dir: Path = Path('repo_cache'),
-                 max_workers: int = 4):
+                 max_workers: int = 4,
+                 infer_types: bool = False):
         """
         Args:
             output_dir: Where KG JSON files are saved.
             cache_dir: Where bare git clones are cached.
             max_workers: Parallel workers for file parsing.
+            infer_types: If True, enable the optional pyright-backed 'uses'
+                         edge enrichment for factory-function call sites.
+                         Requires the `pyright` package (`pip install
+                         kg-construction[types]`); degrades gracefully to
+                         no enrichment if pyright is missing or fails.
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.repo_manager = RepoManager(cache_dir)
-        self.ast_parser = RepoASTParser(max_workers=max_workers)
+        self.ast_parser = RepoASTParser(max_workers=max_workers, infer_types=infer_types)
 
     def build(self, repo: str, commit: str) -> Dict:
         """Build a structural KG for a repo at a specific commit.
