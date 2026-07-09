@@ -376,16 +376,17 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         sites = _get_factory_call_sites(func_node)
         if not sites:
             return
-        # Computed once per function, only if actually needed (a receiver
-        # site was found), matching how _emit_call_edges computes it.
-        local_types: Optional[Dict[str, str]] = None
         for line, col, receiver in sites:
             if receiver is None:
                 if enclosing_class_id:
                     factory_sites.append((line, col, enclosing_class_id, None))
                 continue
-            if local_types is None:
-                local_types = _collect_local_types(func_node)
+            # Position-aware: only consider assignments strictly before this
+            # site's own line. A whole-function summary (no before_line)
+            # would let a LATER reassignment of `receiver` overwrite the
+            # type it actually held at this call, misattributing the
+            # resulting 'uses' edge to the wrong class.
+            local_types = _collect_local_types(func_node, before_line=line + 1)
             source_name = local_types.get(receiver)
             if source_name:
                 factory_sites.append((line, col, None, source_name))

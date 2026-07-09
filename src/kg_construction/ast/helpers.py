@@ -191,6 +191,7 @@ def _extract_property_accesses(
 
 def _collect_local_types(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    before_line: Optional[int] = None,
 ) -> Dict[str, str]:
     """Map local variable names to inferred class names from constructor calls
     and type-annotated parameters.
@@ -204,6 +205,15 @@ def _collect_local_types(
     their locals belong to that scope — but a nested function's own parameters
     are not in scope here either way.
 
+    Args:
+        before_line: If given, only assignments whose target line is strictly
+            before this 1-indexed line number are considered -- callers that
+            need "what type did x hold at a specific call site" (rather than
+            "what's the last type x is ever assigned across the whole
+            function") must pass the call site's line, since a later
+            reassignment elsewhere in the function is otherwise
+            indistinguishable from the type in effect at an earlier site.
+
     Used to resolve attribute calls like `x.save()` to `SomeClass.save` when x's
     type is known from a visible constructor call or parameter annotation.
     """
@@ -214,6 +224,9 @@ def _collect_local_types(
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue  # nested fn — its locals belong to that scope
             if isinstance(child, ast.Assign) and isinstance(child.value, ast.Call):
+                if before_line is not None and child.lineno >= before_line:
+                    _walk(child)
+                    continue
                 call = child.value
                 cls_name: Optional[str] = None
                 if isinstance(call.func, ast.Name) and call.func.id and call.func.id[0].isupper():
