@@ -15,6 +15,14 @@ tree is only ever read.
 This is best-effort enrichment, not a required step: any failure (pyright
 not installed, timeout, protocol error) results in an empty resolution map
 rather than raising, so a KG build never fails because of this step.
+
+Known limitation: hovering an *attribute* assignment (`obj.attr = call()`)
+reports the attribute's already-declared type if one exists anywhere in the
+class (e.g. `self.attr = None` in `__init__`), not the type of this
+particular assignment's right-hand side. Resolution only succeeds when the
+attribute has no prior type declared elsewhere in the class. This does not
+affect bare local variable assignments (`x = call()`), which always resolve
+based on the right-hand side.
 """
 
 import json

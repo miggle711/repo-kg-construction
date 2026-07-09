@@ -177,11 +177,18 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
     # Deduplicate call edges within this file at creation time to avoid
     # accumulating one edge per call-site for frequently called functions
     seen_call_targets: Set[Tuple[str, str]] = set()
-    # Factory-call assignment sites recorded per class, for optional pyright
-    # type resolution (see kg/type_inference.py). Only populated for methods,
-    # matching the existing class-level-only shape of 'uses' edges emitted
-    # via _get_instantiated_classes_in_class below.
-    factory_sites_by_class: Dict[str, List[Tuple[int, int]]] = {}
+    # Factory-call assignment sites recorded for optional pyright type
+    # resolution (see kg/type_inference.py). Each site is
+    # (line, col, source_class_id, source_name), where exactly one of
+    # source_class_id / source_name is set:
+    #   - source_class_id: the enclosing class (self.x = ... / bare x = ...
+    #     inside a method) -- already resolved, matches the existing
+    #     class-level-only shape of 'uses' edges emitted via
+    #     _get_instantiated_classes_in_class below.
+    #   - source_name: the receiver's own class name (other.x = ...), still
+    #     unresolved -- _resolve_edges resolves it the same way it already
+    #     resolves 'uses' edge targets, via class_label_to_ids.
+    factory_sites: List[Tuple[int, int, Optional[str], Optional[str]]] = []
 
     file_id = _make_id(f"file_{repo}_{rel_path}")
     file_type = 'test_file' if _is_test_file(rel_path) else 'file'
@@ -346,6 +353,43 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 metadata={'unresolved': True}
             )))
 
+    def _record_factory_sites(func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+                              enclosing_class_id: Optional[str]):
+        """Record lowercase factory-call sites with a resolvable 'uses' source.
+
+        Each candidate site from _get_factory_call_sites falls into one of
+        three cases:
+            receiver is None, enclosing_class_id is set:
+                self.x = call() or bare x = call() inside a method -- the
+                'uses' edge source is the enclosing class, already known.
+            receiver is a name, resolvable via _collect_local_types:
+                other.x = call() where other's own type is known from a
+                parameter annotation or a prior constructor call in this
+                function -- the 'uses' edge source is that resolved class
+                name (a string; RepoASTParser._resolve_edges resolves it
+                to a node ID the same way it already resolves 'uses' edge
+                targets, via class_label_to_ids).
+            anything else (bare x = call() with no enclosing class, or a
+            receiver whose type can't be determined here):
+                skipped -- there's no class to attach the dependency to.
+        """
+        sites = _get_factory_call_sites(func_node)
+        if not sites:
+            return
+        # Computed once per function, only if actually needed (a receiver
+        # site was found), matching how _emit_call_edges computes it.
+        local_types: Optional[Dict[str, str]] = None
+        for line, col, receiver in sites:
+            if receiver is None:
+                if enclosing_class_id:
+                    factory_sites.append((line, col, enclosing_class_id, None))
+                continue
+            if local_types is None:
+                local_types = _collect_local_types(func_node)
+            source_name = local_types.get(receiver)
+            if source_name:
+                factory_sites.append((line, col, None, source_name))
+
     # Emit class, method, and top-level function nodes
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.ClassDef):
@@ -398,9 +442,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     _emit_access_edges(func_id, child, class_name=node.name)
                     _emit_func_edges(func_id, child, class_name=node.name)
 
-                    factory_sites = _get_factory_call_sites(child)
-                    if factory_sites:
-                        factory_sites_by_class.setdefault(class_id, []).extend(factory_sites)
+                    _record_factory_sites(child, enclosing_class_id=class_id)
 
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             func_type = 'test_function' if node.name.startswith('test_') else 'function'
@@ -414,13 +456,14 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             _emit_access_edges(func_id, node)
             _emit_func_edges(func_id, node)
 
-    factory_sites = [
-        (rel_path, class_id, line, col)
-        for class_id, sites in factory_sites_by_class.items()
-        for line, col in sites
+            _record_factory_sites(node, enclosing_class_id=None)
+
+    factory_sites_out = [
+        (rel_path, source_class_id, source_name, line, col)
+        for line, col, source_class_id, source_name in factory_sites
     ]
 
-    return {'nodes': nodes, 'edges': edges, 'factory_sites': factory_sites}
+    return {'nodes': nodes, 'edges': edges, 'factory_sites': factory_sites_out}
 
 
 # ---------------------------------------------------------------------------
@@ -505,31 +548,47 @@ class RepoASTParser:
         """Resolve recorded factory-call sites via pyright and add 'uses' edges.
 
         Mutates each result's 'edges' list in place, appending one unresolved
-        'uses' edge per successfully resolved site — same shape
-        (source=class_id, target=<type name string>, unresolved=True) as the
-        edges _get_instantiated_classes_in_class already produces, so no
-        changes are needed in _resolve_edges to consume them. Sites that
-        pyright can't resolve (unions, unknown, external types with no repo
-        class) are simply skipped — no edge is added, same as if the site
-        had never been recorded at all.
+        'uses' edge per successfully resolved site. Each recorded site has
+        either a resolved source_class_id (self.x = ... / bare x = ... in a
+        method — the enclosing class is already known) or an unresolved
+        source_name (other.x = ... — the receiver's own class name, known
+        from a parameter annotation or prior constructor call, but not yet
+        an ID). The former produces the same edge shape
+        _get_instantiated_classes_in_class already produces; the latter
+        carries the name via metadata['unresolved_source'] so
+        _resolve_edges can resolve it via class_label_to_ids exactly like
+        it already resolves 'uses' edge targets — no new lookup mechanism,
+        just the existing one applied to the other side of the edge too.
+
+        Sites that pyright can't resolve (unions, unknown, external types
+        with no repo class) are simply skipped — no edge is added, same as
+        if the site had never been recorded at all.
         """
         sites_by_file: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
-        site_index: Dict[Tuple[str, int, int], Tuple[Dict, str]] = {}
+        site_index: Dict[Tuple[str, int, int], Tuple[Dict, Optional[str], Optional[str]]] = {}
 
         for result in results:
-            for rel_path, class_id, line, col in result.get('factory_sites', []):
+            for rel_path, source_class_id, source_name, line, col in result.get('factory_sites', []):
                 sites_by_file[rel_path].append((line, col))
-                site_index[(rel_path, line, col)] = (result, class_id)
+                site_index[(rel_path, line, col)] = (result, source_class_id, source_name)
 
         if not sites_by_file:
             return
 
         resolved = type_inference.resolve_types(repo_dir, dict(sites_by_file))
         for (rel_path, line, col), type_name in resolved.items():
-            result, class_id = site_index[(rel_path, line, col)]
+            result, source_class_id, source_name = site_index[(rel_path, line, col)]
+            metadata = {'unresolved': True, 'source': 'pyright'}
+            if source_class_id is not None:
+                edge_source = source_class_id
+            else:
+                # Placeholder; _resolve_edges replaces this with a real ID
+                # (or drops the edge) using metadata['unresolved_source'].
+                edge_source = None
+                metadata['unresolved_source'] = source_name
             result['edges'].append(asdict(KGEdge(
-                source=class_id, target=type_name, relation='uses',
-                metadata={'unresolved': True, 'source': 'pyright'}
+                source=edge_source, target=type_name, relation='uses',
+                metadata=metadata
             )))
 
     def _collect_files(self, repo: str, repo_dir: Path) -> List[Tuple[str, str, str]]:
@@ -788,14 +847,32 @@ class RepoASTParser:
                 edge_metadata = {'confidence': confidence}
                 if meta.get('source') == 'pyright':
                     edge_metadata['source'] = 'pyright'
-                for target_id in matches:
-                    key = (edge['source'], target_id, 'uses')
-                    if key not in seen_edges:
-                        seen_edges.add(key)
-                        resolved_edges.append(asdict(KGEdge(
-                            source=edge['source'], target=target_id, relation='uses',
-                            metadata=edge_metadata
-                        )))
+
+                # Some pyright-derived 'uses' edges (other.x = factory())
+                # carry an unresolved source class name instead of a real
+                # ID (the enclosing class isn't the source; the receiver's
+                # own class is) -- resolve it the same way the target
+                # above was just resolved, via class_label_to_ids.
+                unresolved_source_name = meta.get('unresolved_source')
+                if unresolved_source_name is not None:
+                    source_matches = class_label_to_ids.get(unresolved_source_name, [])
+                    if not source_matches:
+                        continue
+                    if len(source_matches) > 1:
+                        edge_metadata['confidence'] = 'ambiguous'
+                    source_ids = source_matches
+                else:
+                    source_ids = [edge['source']]
+
+                for source_id in source_ids:
+                    for target_id in matches:
+                        key = (source_id, target_id, 'uses')
+                        if key not in seen_edges:
+                            seen_edges.add(key)
+                            resolved_edges.append(asdict(KGEdge(
+                                source=source_id, target=target_id, relation='uses',
+                                metadata=edge_metadata
+                            )))
 
             elif edge['relation'] == 'overrides' and meta.get('unresolved'):
                 # Deferred: resolved in _resolve_overrides after 'inherits'
