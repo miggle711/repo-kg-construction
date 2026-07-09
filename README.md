@@ -55,9 +55,6 @@ context = extractor.extract(instance, depth=2)
 validator = TestContextValidator(context)
 is_valid, report = validator.validate()
 print(report)
-
-# Visualise a subgraph in the browser
-engine.visualize([files[0]['id']], depth=2, output_path='sessions.html')
 ```
 
 ## Package Structure
@@ -66,7 +63,7 @@ engine.visualize([files[0]['id']], depth=2, output_path='sessions.html')
 src/kg_construction/
 ├── kg/
 │   ├── builder.py       # Clone repo, parse AST, emit KG nodes and edges
-│   ├── query.py         # In-memory query engine and pyvis visualisation
+│   ├── query.py         # In-memory query engine
 │   ├── validator.py     # Full KG validation (post-extraction sanity checks)
 │   └── repo_manager.py  # Git clone and archive extraction
 ├── ast/
@@ -140,9 +137,6 @@ engine.find_function_by_name('send')        # exact label match
 
 # Export
 engine.export_subgraph([node_id, ...])      # nodes + 1-hop edges as dict
-
-# Visualise (requires pyvis)
-engine.visualize([node_id], depth=2, output_path='graph.html')
 ```
 
 ## Running Tests
@@ -173,10 +167,6 @@ pytest tests/ -v
 pip install -e .
 
 # Optional extras, as needed:
-pip install -e ".[groq]"      # GroqTestGenerator
-pip install -e ".[anthropic]" # AnthropicTestGenerator
-pip install -e ".[llm]"       # both LLM backends
-pip install -e ".[viz]"       # engine.visualize() (pyvis)
 pip install -e ".[datasets]"  # SWE-bench dataset examples
 pip install -e ".[all]"       # everything
 ```
