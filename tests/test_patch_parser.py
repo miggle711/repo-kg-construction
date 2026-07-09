@@ -111,3 +111,56 @@ class TestPatchParser:
 """
         changed = PatchParser.extract_changed_functions(patch, 'requests/sessions.py')
         assert len(changed) == 0
+
+    def test_decorator_only_change_same_hunk(self):
+        """Detect the function when a changed decorator's def is later context in the same hunk."""
+        patch = """--- a/app.py
++++ b/app.py
+@@ -10,3 +10,3 @@
+-@app.route("/old")
++@app.route("/new")
+ def handler():
+     pass
+"""
+        changed = PatchParser.extract_changed_functions(patch, 'app.py')
+        assert 'handler' in changed
+
+    def test_decorator_only_change_across_hunk_boundary(self):
+        """Detect the function when its def falls in a later hunk than the changed decorator.
+
+        A small diff context window can put a hunk boundary between a
+        modified decorator and the otherwise-unchanged function it
+        decorates, so the def line never appears in the same hunk as the
+        decorator line. The pending decorator must carry across hunks
+        within the same file.
+        """
+        patch = """--- a/app.py
++++ b/app.py
+@@ -10,1 +10,1 @@
+-@app.route("/old")
++@app.route("/new")
+@@ -20,2 +20,2 @@
+ def handler():
+     pass
+"""
+        changed = PatchParser.extract_changed_functions(patch, 'app.py')
+        assert 'handler' in changed
+
+    def test_pending_decorator_does_not_leak_across_files(self):
+        """A decorator with no following def/class in its own file resolves to nothing.
+
+        It must not attach to the first def/class encountered in a
+        different file later in the same multi-file patch.
+        """
+        patch = """--- a/other.py
++++ b/other.py
+@@ -5,1 +5,1 @@
++@some_decorator
+--- a/app.py
++++ b/app.py
+@@ -20,2 +20,2 @@
+ def unrelated():
+     pass
+"""
+        changed_other = PatchParser.extract_changed_functions(patch, 'other.py')
+        assert changed_other == set()
