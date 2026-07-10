@@ -57,27 +57,47 @@ is_valid, report = validator.validate()
 print(report)
 ```
 
+## Optional: pyright-backed type inference
+
+The uppercase-heuristic that detects `uses` edges (`x = SomeClass()`) can't see class
+instances returned by a lowercase factory function (`session = requests.session()`). Pass
+`infer_types=True` to resolve these via a real type checker (pyright) instead:
+
+```python
+builder = RepoKGBuilder(infer_types=True)
+kg = builder.build('psf/requests', 'a0df2cbb')
+```
+
+This is opt-in and off by default — it adds a `pyright` dependency and a per-repo
+subprocess cost (roughly 1-3s for a mid-sized package). If pyright isn't installed, or
+resolution fails for any reason, the KG build still succeeds; you just get the
+uppercase-heuristic `uses` edges only. Resolved edges carry `metadata.source == 'pyright'`
+so you can distinguish them from heuristic-derived ones. Requires the `types` extra (see
+Installation).
+
 ## Package Structure
 
 ```text
 src/kg_construction/
 ├── kg/
-│   ├── builder.py       # Clone repo, parse AST, emit KG nodes and edges
-│   ├── query.py         # In-memory query engine
-│   ├── validator.py     # Full KG validation (post-extraction sanity checks)
-│   └── repo_manager.py  # Git clone and archive extraction
+│   ├── builder.py         # Clone repo, parse AST, emit KG nodes and edges
+│   ├── query.py           # In-memory query engine
+│   ├── validator.py       # Full KG validation (post-extraction sanity checks)
+│   ├── repo_manager.py    # Git clone and archive extraction
+│   ├── traversal.py       # Shared BFS graph traversal
+│   └── type_inference.py  # Optional pyright-backed type resolution for factory calls
 ├── ast/
-│   └── helpers.py       # Pure AST-in/data-out utilities (22 helper functions)
+│   └── helpers.py         # Pure AST-in/data-out utilities
 ├── extraction/
-│   ├── context.py       # Subgraph extraction (TestContext, TestContextExtractor)
-│   └── validator.py     # Subgraph validation for LLM test generation
-└── pipeline.py          # Extract and validate orchestration (extract_and_validate)
+│   ├── context.py         # Subgraph extraction (TestContext, TestContextExtractor)
+│   ├── validator.py       # Subgraph validation for LLM test generation
+│   └── patch.py           # Unified diff parsing (changed-function detection)
+├── llm/
+│   └── llm_serializer.py  # Flat subgraph -> hierarchical JSON for LLM prompts
+└── pipeline.py            # Extract and validate orchestration (extract_and_validate)
 
-run.py                   # CLI shim (thin wrapper around pipeline.py)
-tests/
-├── unit/                # Unit tests for AST helpers and KG builder
-├── integration/         # Integration tests with real KGs
-└── e2e/                 # End-to-end pipeline tests
+run.py                     # CLI shim (thin wrapper around pipeline.py)
+tests/                      # Flat pytest suite (no subdirectories)
 ```
 
 ## Graph Structure
@@ -104,7 +124,7 @@ tests/
 | `accesses` | Function reads an `@property`-decorated attribute (no call syntax; confidence: `qualified`) |
 | `inherits` | Class inherits from another class |
 | `tests` | Test function targets a specific function |
-| `uses` | Class instantiates another class |
+| `uses` | Class instantiates another class (or, with `infer_types=True`, a lowercase factory-function call resolved via pyright — see below) |
 | `overrides` | Method overrides a parent class method |
 | `depends_on` | Function uses a specific import |
 | `module_depends_on` | File depends on another file via imports |
@@ -145,20 +165,17 @@ engine.export_subgraph([node_id, ...])      # nodes + 1-hop edges as dict
 # Install in editable mode first
 pip install -e .
 
-# Run unit tests
-python3 tests/unit/test_kg_builder.py -v
-python3 tests/unit/test_subgraph_validator.py -v
-
-# Run integration tests (requires pre-built KGs in kg_output/)
-python3 tests/integration/test_subgraph_validator_integration.py -v
-
-# Run all tests with pytest (if available)
+# Run the full suite
 pytest tests/ -v
+
+# Run a single test file
+pytest tests/test_uses_edge_confidence.py -v
 ```
 
-**Unit tests** run entirely on synthetic Python source — no git clone or network access required. 35+ tests covering all AST helpers and edge types end-to-end through the KG builder.
-
-**Integration tests** validate real subgraph extraction and validation with pre-built KGs (skipped gracefully if KGs not present).
+Tests run entirely on synthetic Python source written to `tmp_path` fixtures — no git
+clone or network access required. A handful of tests that exercise `infer_types=True`
+require the optional `pyright` package (see Installation) and skip automatically if it
+isn't installed.
 
 ## Installation
 
@@ -168,6 +185,7 @@ pip install -e .
 
 # Optional extras, as needed:
 pip install -e ".[datasets]"  # SWE-bench dataset examples
+pip install -e ".[types]"     # pyright-backed type inference (infer_types=True)
 pip install -e ".[all]"       # everything
 ```
 
