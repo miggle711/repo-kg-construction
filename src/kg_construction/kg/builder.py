@@ -863,13 +863,17 @@ class RepoASTParser:
                 # carry an unresolved source class name instead of a real
                 # ID (the enclosing class isn't the source; the receiver's
                 # own class is) -- resolve it the same way the target
-                # above was just resolved, via class_label_to_ids.
+                # above was just resolved, via class_label_to_ids, including
+                # the same name-collides-with-a-real-callable downgrade (a
+                # source name is exactly as capable of colliding with an
+                # unrelated function/method name as a target name is).
                 unresolved_source_name = meta.get('unresolved_source')
                 if unresolved_source_name is not None:
                     source_matches = class_label_to_ids.get(unresolved_source_name, [])
                     if not source_matches:
                         continue
-                    if len(source_matches) > 1:
+                    source_collides_with_callable = unresolved_source_name in label_to_ids
+                    if len(source_matches) > 1 or source_collides_with_callable:
                         edge_metadata['confidence'] = 'ambiguous'
                     source_ids = source_matches
                 else:
