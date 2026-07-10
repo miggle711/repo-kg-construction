@@ -245,3 +245,48 @@ class TestPyrightUsesEdgeNonSelfReceiver:
 
         uses_edges = [e for e in kg["edges"] if e["relation"] == "uses"]
         assert uses_edges == []
+
+    @pyright_required
+    def test_source_collision_with_callable_downgrades_confidence(self, tmp_path):
+        """Regression test for issue #32: a resolved source class name that
+        collides with a real function/method name elsewhere in the repo
+        must be reported 'ambiguous', not 'exact' -- the same downgrade the
+        target side of a 'uses' edge already applies on a name collision.
+        """
+        (tmp_path / "mod.py").write_text(
+            "class Config:\n"
+            "    pass\n"
+            "\n"
+            "def Config():\n"
+            "    \"\"\"Not a class -- a function sharing the class's name.\"\"\"\n"
+            "    return None\n"
+            "\n"
+            "class Parser:\n"
+            "    pass\n"
+            "\n"
+            "def build_parser():\n"
+            "    return Parser()\n"
+            "\n"
+            "def configure(config: Config):\n"
+            "    config.parser = build_parser()\n"
+        )
+        parser = RepoASTParser(max_workers=1, infer_types=True)
+        kg = parser.parse_repo("test/repo", tmp_path)
+
+        config_id = next(
+            n["id"] for n in kg["nodes"]
+            if n["type"] == "class" and n["label"] == "Config"
+        )
+        parser_id = next(
+            n["id"] for n in kg["nodes"]
+            if n["type"] == "class" and n["label"] == "Parser"
+        )
+
+        uses_edges = [
+            e for e in kg["edges"]
+            if e["relation"] == "uses"
+            and e["source"] == config_id
+            and e["target"] == parser_id
+        ]
+        assert len(uses_edges) == 1
+        assert uses_edges[0]["metadata"]["confidence"] == "ambiguous"
