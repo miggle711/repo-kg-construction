@@ -29,7 +29,7 @@ class TestFactoryCallSiteDetection:
             "    s = requests.session()\n"
         )
         sites = _get_factory_call_sites(func)
-        assert sites == [(1, 4)]
+        assert sites == [(1, 4, None)]
 
     def test_detects_self_attribute_assignment_from_lowercase_call(self):
         func = _first_function(
@@ -37,11 +37,13 @@ class TestFactoryCallSiteDetection:
             "    self.s = requests.session()\n"
         )
         sites = _get_factory_call_sites(func)
-        # position must land on the attribute name 's', not on 'self'
-        line, col = sites[0]
+        # position must land on the attribute name 's', not on 'self';
+        # receiver is None since the enclosing class is already known
+        line, col, receiver = sites[0]
         source_line = "    self.s = requests.session()"
         assert source_line[col] == "s"
         assert source_line[col - 1] == "."
+        assert receiver is None
 
     def test_ignores_uppercase_callee_bare_name(self):
         func = _first_function(
@@ -63,7 +65,7 @@ class TestFactoryCallSiteDetection:
             "    x = pool.connection()\n"
         )
         sites = _get_factory_call_sites(func)
-        assert sites == [(1, 4)]
+        assert sites == [(1, 4, None)]
 
     def test_ignores_tuple_unpacking_target(self):
         func = _first_function(
@@ -95,12 +97,26 @@ class TestFactoryCallSiteDetection:
             "    b = make_b()\n"
         )
         sites = _get_factory_call_sites(func)
-        assert sites == [(1, 4), (2, 4)]
+        assert sites == [(1, 4, None), (2, 4, None)]
 
-    def test_ignores_non_self_attribute_target(self):
-        """other.attr = factory() -- not `self`, skipped (only self.x supported)."""
+    def test_detects_non_self_attribute_target_with_receiver_name(self):
+        """other.attr = factory() -- receiver is recorded so the caller can
+        resolve `other`'s own type before deciding the uses-edge source.
+        """
         func = _first_function(
             "def build(other):\n"
             "    other.thing = make_thing()\n"
+        )
+        sites = _get_factory_call_sites(func)
+        line, col, receiver = sites[0]
+        source_line = "    other.thing = make_thing()"
+        assert source_line[col] == "t"  # points at 'thing', not 'other'
+        assert receiver == "other"
+
+    def test_ignores_attribute_chain_deeper_than_one_level(self):
+        """other.nested.attr = factory() -- receiver isn't a simple Name."""
+        func = _first_function(
+            "def build(other):\n"
+            "    other.nested.thing = make_thing()\n"
         )
         assert _get_factory_call_sites(func) == []

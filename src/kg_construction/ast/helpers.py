@@ -191,6 +191,7 @@ def _extract_property_accesses(
 
 def _collect_local_types(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    before_line: Optional[int] = None,
 ) -> Dict[str, str]:
     """Map local variable names to inferred class names from constructor calls
     and type-annotated parameters.
@@ -204,6 +205,15 @@ def _collect_local_types(
     their locals belong to that scope — but a nested function's own parameters
     are not in scope here either way.
 
+    Args:
+        before_line: If given, only assignments whose target line is strictly
+            before this 1-indexed line number are considered -- callers that
+            need "what type did x hold at a specific call site" (rather than
+            "what's the last type x is ever assigned across the whole
+            function") must pass the call site's line, since a later
+            reassignment elsewhere in the function is otherwise
+            indistinguishable from the type in effect at an earlier site.
+
     Used to resolve attribute calls like `x.save()` to `SomeClass.save` when x's
     type is known from a visible constructor call or parameter annotation.
     """
@@ -214,6 +224,9 @@ def _collect_local_types(
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue  # nested fn — its locals belong to that scope
             if isinstance(child, ast.Assign) and isinstance(child.value, ast.Call):
+                if before_line is not None and child.lineno >= before_line:
+                    _walk(child)
+                    continue
                 call = child.value
                 cls_name: Optional[str] = None
                 if isinstance(call.func, ast.Name) and call.func.id and call.func.id[0].isupper():
@@ -821,33 +834,38 @@ def _get_instantiated_classes(
 
 def _get_factory_call_sites(
     func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
-) -> List[Tuple[int, int]]:
+) -> List[Tuple[int, int, Optional[str]]]:
     """Find variable assignments from lowercase-named calls (candidate factories).
 
-    Detects patterns like `x = some_call(...)` and `self.x = some_call(...)`
-    where the callee name does NOT start with an uppercase letter — the exact
-    complement of the heuristic in _get_instantiated_classes(), which only
-    catches uppercase (PEP 8 class convention) callees. A lowercase callee
-    returning a class instance (e.g. `self.session = requests.session()`) is
-    invisible to that heuristic; this function instead records the
-    assignment's source location so an external type checker (see
-    kg/type_inference.py) can be asked what type the right-hand side
-    actually evaluates to.
+    Detects patterns like `x = some_call(...)`, `self.x = some_call(...)`,
+    and `other.x = some_call(...)` where the callee name does NOT start with
+    an uppercase letter — the exact complement of the heuristic in
+    _get_instantiated_classes(), which only catches uppercase (PEP 8 class
+    convention) callees. A lowercase callee returning a class instance (e.g.
+    `self.session = requests.session()`) is invisible to that heuristic;
+    this function instead records the assignment's source location so an
+    external type checker (see kg/type_inference.py) can be asked what type
+    the right-hand side actually evaluates to.
 
-    Only simple `Name` targets (`x = ...`) and simple `self.<attr>`
-    targets (`self.x = ...`) are recorded (matching the restriction
-    _collect_local_types uses for the `Name` case); tuple targets and
-    attribute chains deeper than one level are skipped since they don't
-    reduce to a single (line, col) an editor-style hover query resolves
-    cleanly.
+    Only simple `Name` targets (`x = ...`) and single-level attribute targets
+    (`receiver.x = ...`, where receiver is itself a simple `Name`) are
+    recorded; tuple targets and attribute chains deeper than one level are
+    skipped since they don't reduce to a single (line, col) an editor-style
+    hover query resolves cleanly.
 
     Returns:
-        List of (lineno, col_offset) tuples, one per candidate assignment
-        target, 0-indexed line/col ready for an LSP-style position query
-        (ast reports 1-indexed lines, converted here). For `self.x = ...`
-        the position points at the attribute name `x`, not `self`.
+        List of (lineno, col_offset, receiver) tuples, one per candidate
+        assignment target, 0-indexed line/col ready for an LSP-style
+        position query (ast reports 1-indexed lines, converted here).
+        `receiver` is None for a bare `Name` target (`x = ...`) or a
+        `self.x = ...` target (the enclosing class is already known from
+        context); for any other `receiver.x = ...` target, `receiver` is
+        that name, so the caller can resolve the receiver's own type (e.g.
+        via _collect_local_types) to know which class the resulting `uses`
+        edge should originate from. For attribute targets the position
+        points at the attribute name itself, not the receiver.
     """
-    sites: List[Tuple[int, int]] = []
+    sites: List[Tuple[int, int, Optional[str]]] = []
 
     def _walk(n: ast.AST):
         for child in ast.iter_child_nodes(n):
@@ -863,16 +881,16 @@ def _get_factory_call_sites(
                 if callee_name and not callee_name[0].isupper():
                     for target in child.targets:
                         if isinstance(target, ast.Name):
-                            sites.append((target.lineno - 1, target.col_offset))
+                            sites.append((target.lineno - 1, target.col_offset, None))
                         elif (
                             isinstance(target, ast.Attribute)
                             and isinstance(target.value, ast.Name)
-                            and target.value.id == 'self'
                         ):
                             # Position the query at the attribute name itself
-                            # (e.g. the 's' in 'self.s'), not at 'self'.
+                            # (e.g. the 's' in 'self.s'), not at the receiver.
                             attr_col = target.end_col_offset - len(target.attr)
-                            sites.append((target.lineno - 1, attr_col))
+                            receiver = None if target.value.id == 'self' else target.value.id
+                            sites.append((target.lineno - 1, attr_col, receiver))
             _walk(child)
 
     _walk(func_node)
