@@ -218,7 +218,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 edges.append(asdict(KGEdge(source=file_id, target=imp_id, relation='imports')))
 
     def _emit_call_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
-                         class_name: Optional[str] = None):
+                         local_types: Dict[str, str], class_name: Optional[str] = None):
         """Emit one 'calls' edge per unique (caller, callee_name) pair.
 
         Edges are marked unresolved=True because callee_name is just a string
@@ -235,8 +235,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                                json.loads → 'json.loads')
             receiver:          raw receiver expression for attribute calls
                                (kept for debugging / future heuristics)
+
+        Args:
+            local_types: Precomputed _collect_local_types(func_node) result,
+                         shared with _emit_access_edges to avoid walking the
+                         same function body twice for the same data.
         """
-        local_types = _collect_local_types(func_node)
         for call in ast.walk(func_node):
             if not isinstance(call, ast.Call):
                 continue
@@ -273,7 +277,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             )))
 
     def _emit_access_edges(func_id: str, func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
-                           class_name: Optional[str] = None):
+                           local_types: Dict[str, str], class_name: Optional[str] = None):
         """Emit one 'accesses' edge per unique (caller, attr_name) pair.
 
         Covers @property reads (obj.attr, never obj.attr()) that
@@ -286,8 +290,12 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         Uses the same hint shape as 'calls' edges (class_hint,
         local_type_hint, import_resolved, receiver) so pass-2 resolution
         can share the same disambiguation logic.
+
+        Args:
+            local_types: Precomputed _collect_local_types(func_node) result,
+                         shared with _emit_call_edges to avoid walking the
+                         same function body twice for the same data.
         """
-        local_types = _collect_local_types(func_node)
         seen_access_targets: Set[Tuple[str, str]] = set()
         for attr_name, receiver in _extract_property_accesses(func_node):
             if (func_id, attr_name) in seen_access_targets:
@@ -439,8 +447,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                                 source=func_id, target=f"{base}.{child.name}", relation='overrides',
                                 metadata={'unresolved': True}
                             )))
-                    _emit_call_edges(func_id, child, class_name=node.name)
-                    _emit_access_edges(func_id, child, class_name=node.name)
+                    child_local_types = _collect_local_types(child)
+                    _emit_call_edges(func_id, child, child_local_types, class_name=node.name)
+                    _emit_access_edges(func_id, child, child_local_types, class_name=node.name)
                     _emit_func_edges(func_id, child, class_name=node.name)
 
                     _record_factory_sites(child, enclosing_class_id=class_id)
@@ -453,8 +462,9 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                 metadata=_build_func_metadata(node, rel_path, repo, import_map=import_map)
             )))
             edges.append(asdict(KGEdge(source=file_id, target=func_id, relation='contains')))
-            _emit_call_edges(func_id, node)
-            _emit_access_edges(func_id, node)
+            node_local_types = _collect_local_types(node)
+            _emit_call_edges(func_id, node, node_local_types)
+            _emit_access_edges(func_id, node, node_local_types)
             _emit_func_edges(func_id, node)
 
             _record_factory_sites(node, enclosing_class_id=None)
