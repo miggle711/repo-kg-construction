@@ -164,3 +164,67 @@ class TestPatchParser:
 """
         changed_other = PatchParser.extract_changed_functions(patch, 'other.py')
         assert changed_other == set()
+
+    def test_wide_context_does_not_sweep_in_unmodified_sibling(self):
+        """Regression test for issue #43: a diff hunk wide enough to include
+        an entirely unmodified neighboring function's def line must not
+        report that function as changed -- only the function whose body (or
+        decorator) actually changed.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,15 +1,15 @@
+ def delete(self, url, **kwargs):
+     kwargs.setdefault('allow_redirects', True)
+     return self.request('DELETE', url, **kwargs)
+
+ def send(self, request, **kwargs):
+     kwargs.setdefault('stream', self.stream)
+     kwargs.setdefault('verify', self.verify)
+     kwargs.setdefault('cert', self.cert)
+-    kwargs.setdefault('proxies', self.proxies)
++    kwargs.setdefault('proxies', self.rebuild_proxies(request, self.proxies))
+
+     pass
+"""
+        changed = PatchParser.extract_changed_functions(patch, 'mod.py')
+        assert changed == {'send'}
+
+    def test_body_change_detection_does_not_leak_into_siblings(self):
+        """A changed line inside one function's body must not cause a
+        following sibling function (pure context) to be reported as changed.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,10 +1,10 @@
+ def unrelated():
+     pass
+
+ def target():
+-    return 1
++    return 2
+
+ def another_unrelated():
+     pass
+"""
+        changed = PatchParser.extract_changed_functions(patch, 'mod.py')
+        assert changed == {'target'}
+
+    def test_context_only_def_with_unchanged_body_not_reported(self):
+        """A def/class line and its whole body appearing as pure unchanged
+        context (no decorator change either) must not be reported --
+        it's only visible because of the hunk's context window.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,8 +1,9 @@
+ def untouched():
+     return 1
+
+ def changed():
+-    return 2
++    return 3
+"""
+        changed = PatchParser.extract_changed_functions(patch, 'mod.py')
+        assert changed == {'changed'}
+        assert 'untouched' not in changed
