@@ -168,6 +168,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
         source = Path(abs_path).read_text(encoding='utf-8', errors='replace')
     except OSError:
         return None
+    source_lines = source.splitlines(keepends=True)
 
     if source.count('\n') > MAX_FILE_LINES:
         return None
@@ -442,7 +443,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                         id=func_id, type=func_type, label=child.name,
                         metadata=_build_func_metadata(child, rel_path, repo,
                                                       parent_class=node.name,
-                                                      import_map=import_map)
+                                                      import_map=import_map,
+                                                      source_lines=source_lines)
                     )))
                     edges.append(asdict(KGEdge(source=class_id, target=func_id, relation='contains')))
                     # overrides: if method name matches a known base class method (resolved in pass 2)
@@ -464,7 +466,8 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             func_id = _make_id(f"func_{repo}_{rel_path}_{node.name}")
             nodes.append(asdict(KGNode(
                 id=func_id, type=func_type, label=node.name,
-                metadata=_build_func_metadata(node, rel_path, repo, import_map=import_map)
+                metadata=_build_func_metadata(node, rel_path, repo, import_map=import_map,
+                                              source_lines=source_lines)
             )))
             edges.append(asdict(KGEdge(source=file_id, target=func_id, relation='contains')))
             node_local_types = _collect_local_types(node)
