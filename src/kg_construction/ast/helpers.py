@@ -333,6 +333,40 @@ def _get_signature(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Dict:
     return result
 
 
+def _get_signature_and_source_text(
+    func_node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
+    source_lines: Optional[List[str]],
+) -> Tuple[str, str]:
+    """Slice a function's own `def` line(s) and full source text out of its
+    enclosing file, via the AST node's line range.
+
+    Both are LLM-facing convenience fields (LLMSerializer renders them
+    directly into a test-generation prompt) -- distinct from `params`,
+    which is structured data for programmatic use. Prior to this, neither
+    was ever populated, so the KG-augmented arm's prompt showed a
+    docstring and a param-name list but never the actual code being
+    tested (see kg-test-generation#51/#25/#28 -- several test-quality
+    bugs trace back to the model never seeing the function's real body).
+
+    Returns:
+        (signature, source_code) -- both "" if source_lines isn't given,
+        or if func_node.body is empty (should not happen for valid AST,
+        but avoids an index error on malformed input rather than raising).
+    """
+    if not source_lines or not func_node.body:
+        return "", ""
+
+    source_code = "".join(source_lines[func_node.lineno - 1 : func_node.end_lineno])
+
+    # The signature is everything from the `def`/`async def` line up to
+    # (not including) the first body statement -- covers multi-line
+    # signatures (wrapped params) without pulling in the function body.
+    first_body_lineno = func_node.body[0].lineno
+    signature_end = first_body_lineno - 1 if first_body_lineno > func_node.lineno else func_node.lineno
+    signature = "".join(source_lines[func_node.lineno - 1 : signature_end]).rstrip()
+    return signature, source_code
+
+
 def _get_exceptions(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> Dict:
     """Extract exception types raised and caught within a function body.
 
@@ -979,6 +1013,7 @@ def _build_func_metadata(
     repo: str,
     parent_class: Optional[str] = None,
     import_map: Optional[Dict[str, str]] = None,
+    source_lines: Optional[List[str]] = None,
 ) -> Dict:
     """Build the full metadata dict for a function or method node.
 
@@ -992,16 +1027,24 @@ def _build_func_metadata(
         parent_class: Class name if this is a method, else None.
         import_map: {local_name: fully_qualified_name} dict for resolving
                     external type dependencies. Defaults to {}.
+        source_lines: The enclosing file's source, split via
+                      str.splitlines(keepends=True), used to slice out this
+                      function's exact source text and its `def` line(s) for
+                      the 'source_code'/'signature' metadata fields. If not
+                      given (e.g. a caller with no file text handy), both
+                      fields are left empty rather than failing the build --
+                      LLMSerializer already treats them as optional.
 
     Returns:
-        Dict with keys: filepath, repo, lineno, params, returns, decorators,
-        docstring, raises, catches, is_async, branches, assert_patterns,
-        external_deps, side_effects, and optionally 'class' if parent_class
-        is provided.
+        Dict with keys: filepath, repo, lineno, params, returns, signature,
+        source_code, decorators, docstring, raises, catches, is_async,
+        branches, assert_patterns, external_deps, side_effects, and
+        optionally 'class' if parent_class is provided.
     """
     sig = _get_signature(func_node)
     exc = _get_exceptions(func_node)
     _import_map = import_map or {}
+    signature_str, source_code = _get_signature_and_source_text(func_node, source_lines)
 
     # external_deps: annotation types + instantiated classes that appear in import_map
     annotation_types = _get_annotation_type_names(func_node)
@@ -1023,6 +1066,8 @@ def _build_func_metadata(
         'lineno': func_node.lineno,
         'params': sig['params'],
         'returns': sig.get('returns'),
+        'signature': signature_str,
+        'source_code': source_code,
         'decorators': _get_decorators(func_node),
         'docstring': _get_docstring(func_node),
         'raises': exc['raises'],
