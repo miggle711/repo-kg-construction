@@ -98,6 +98,12 @@ class LLMSerializer:
             - module: Dotted import path (e.g. "requests.sessions"), derived
                       from the node's filepath -- so the LLM can write a
                       real import instead of guessing/fabricating one.
+            - class_name: Owning class name (e.g. "Session") when type is
+                          "method", else "" -- a method isn't importable by
+                          name on its own (e.g. `from requests.sessions
+                          import resolve_redirects` doesn't exist); the LLM
+                          needs the class to import and instantiate instead
+                          (see kg-test-generation issue #14).
             - signature: Function signature
             - docstring: Function docstring
             - exceptions: Declared exceptions
@@ -115,6 +121,7 @@ class LLMSerializer:
             "type": seed_node.get("type", "function"),
             "module": _filepath_to_module(metadata.get("filepath", "")),
             "filepath": metadata.get("filepath", ""),
+            "class_name": metadata.get("class", ""),
             "signature": metadata.get("signature", ""),
             "docstring": metadata.get("docstring", ""),
             "exceptions": metadata.get("exceptions", []),
@@ -237,7 +244,9 @@ class LLMSerializer:
         metadata = node.get("metadata", {})
         return {
             "name": node.get("label", ""),
+            "type": node.get("type", "function"),
             "module": _filepath_to_module(metadata.get("filepath", "")),
+            "class_name": metadata.get("class", ""),
             "signature": metadata.get("signature", ""),
             "docstring": metadata.get("docstring", ""),
             "source_code": metadata.get("source_code", ""),
