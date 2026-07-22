@@ -192,3 +192,105 @@ class TestSerializeContextSection:
         assert len(related) == 1
         assert related[0]["type"] == "instantiation"
         assert related[0]["module"] == "requests.adapters"
+
+
+class TestSiblingMethods:
+    """Issue #50: sibling methods reached via 'contains' BFS were present
+    in context_nodes but silently dropped at serialization -- e.g. a
+    method's own required setup (PreparedRequest.prepare()) was never
+    visible to the model, only the method actually under test. This is
+    context a flat single-function extraction (the baseline arm) can
+    never provide, since it has no notion of "what else does this class
+    define" -- see kg-test-generation#28's precondition-visibility gap.
+    """
+
+    def _class_seed_instance(self, sibling_relation="contains", sibling_target_is_seed=False):
+        seed_node = {
+            "id": "seed", "label": "prepare_content_length", "type": "method",
+            "metadata": {"filepath": "requests/models.py", "class": "PreparedRequest"},
+        }
+        class_node = {
+            "id": "class_preparedrequest", "label": "PreparedRequest", "type": "class",
+            "metadata": {"filepath": "requests/models.py"},
+        }
+        sibling_node = {
+            "id": "sibling", "label": "prepare", "type": "method",
+            "metadata": {
+                "filepath": "requests/models.py", "class": "PreparedRequest",
+                "source_code": "def prepare(self, ...):\n    self.headers = {}\n",
+            },
+        }
+        sibling_edge_target = seed_node["id"] if sibling_target_is_seed else sibling_node["id"]
+        return {
+            "seeds": [seed_node],
+            "context_nodes": [class_node, sibling_node],
+            "edges": [
+                {"source": class_node["id"], "target": seed_node["id"], "relation": "contains"},
+                {"source": class_node["id"], "target": sibling_edge_target, "relation": sibling_relation},
+            ],
+            "test_nodes": [],
+        }
+
+    def test_sibling_method_of_seed_class_is_included(self):
+        result = LLMSerializer().serialize(self._class_seed_instance())
+
+        siblings = result["context"]["sibling_methods"]
+        assert len(siblings) == 1
+        assert siblings[0]["name"] == "prepare"
+        assert siblings[0]["module"] == "requests.models"
+        assert "self.headers = {}" in siblings[0]["source_code"]
+
+    def test_seed_does_not_list_itself_as_its_own_sibling(self):
+        """The class->seed 'contains' edge itself must not cause the seed
+        to appear in its own sibling_methods list.
+        """
+        result = LLMSerializer().serialize(
+            self._class_seed_instance(sibling_target_is_seed=True)
+        )
+
+        # Only the class->seed edge exists in this instance (both edges
+        # point at the seed) -- sibling_methods must be empty, not contain
+        # the seed itself.
+        assert result["context"]["sibling_methods"] == []
+
+    def test_contains_edge_from_unrelated_class_is_not_treated_as_sibling(self):
+        """A 'contains' edge from a DIFFERENT class (e.g. one reached via
+        an unrelated 'related' relationship elsewhere in the subgraph)
+        must not be mistaken for a sibling of the seed's own class.
+        """
+        seed_node = {
+            "id": "seed", "label": "handle_401", "type": "method",
+            "metadata": {"filepath": "requests/auth.py", "class": "HTTPDigestAuth"},
+        }
+        seed_class_node = {
+            "id": "class_httpdigestauth", "label": "HTTPDigestAuth", "type": "class",
+            "metadata": {"filepath": "requests/auth.py"},
+        }
+        unrelated_class_node = {
+            "id": "class_unrelated", "label": "SomeOtherClass", "type": "class",
+            "metadata": {"filepath": "requests/other.py"},
+        }
+        unrelated_method_node = {
+            "id": "unrelated_method", "label": "some_method", "type": "method",
+            "metadata": {"filepath": "requests/other.py", "class": "SomeOtherClass"},
+        }
+        instance = {
+            "seeds": [seed_node],
+            "context_nodes": [seed_class_node, unrelated_class_node, unrelated_method_node],
+            "edges": [
+                {"source": seed_class_node["id"], "target": seed_node["id"], "relation": "contains"},
+                {"source": unrelated_class_node["id"], "target": unrelated_method_node["id"], "relation": "contains"},
+            ],
+            "test_nodes": [],
+        }
+        result = LLMSerializer().serialize(instance)
+
+        assert result["context"]["sibling_methods"] == []
+
+    def test_no_sibling_methods_is_an_empty_list_not_missing_key(self):
+        seed_node = {"id": "seed", "label": "f", "type": "function", "metadata": {}}
+        result = LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": [], "edges": [], "test_nodes": []}
+        )
+
+        assert result["context"]["sibling_methods"] == []
