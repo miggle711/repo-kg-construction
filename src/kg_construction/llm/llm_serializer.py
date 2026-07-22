@@ -19,6 +19,20 @@ from typing import Dict, List, Optional, Set
 from dataclasses import dataclass
 
 
+def _filepath_to_module(filepath: str) -> str:
+    """Convert a repo-relative filepath (e.g. "requests/sessions.py") to a
+    dotted module path (e.g. "requests.sessions") -- same derivation
+    kg.builder.py uses internally to resolve qualified names, but that
+    result was never carried through to the LLM-facing serialization,
+    leaving the model to guess import paths (see issue #6: this caused
+    the model to fabricate placeholder imports like
+    "from your_module import X").
+    """
+    if not filepath:
+        return ""
+    return filepath.removesuffix(".py").replace("/", ".")
+
+
 @dataclass
 class LLMInput:
     """Hierarchical JSON structure passed to LLM.
@@ -81,6 +95,9 @@ class LLMSerializer:
 
         Returns dict with:
             - function_name: Name of the modified function
+            - module: Dotted import path (e.g. "requests.sessions"), derived
+                      from the node's filepath -- so the LLM can write a
+                      real import instead of guessing/fabricating one.
             - signature: Function signature
             - docstring: Function docstring
             - exceptions: Declared exceptions
@@ -96,6 +113,8 @@ class LLMSerializer:
         return {
             "function_name": seed_node.get("label", ""),
             "type": seed_node.get("type", "function"),
+            "module": _filepath_to_module(metadata.get("filepath", "")),
+            "filepath": metadata.get("filepath", ""),
             "signature": metadata.get("signature", ""),
             "docstring": metadata.get("docstring", ""),
             "exceptions": metadata.get("exceptions", []),
@@ -153,6 +172,7 @@ class LLMSerializer:
                     {
                         "type": "parent_class",
                         "name": tgt_node.get("label", ""),
+                        "module": _filepath_to_module(tgt_node.get("metadata", {}).get("filepath", "")),
                         "source_code": tgt_node.get("metadata", {}).get("source_code", ""),
                     }
                 )
@@ -161,6 +181,7 @@ class LLMSerializer:
                     {
                         "type": "instantiation",
                         "name": tgt_node.get("label", ""),
+                        "module": _filepath_to_module(tgt_node.get("metadata", {}).get("filepath", "")),
                     }
                 )
 
@@ -216,6 +237,7 @@ class LLMSerializer:
         metadata = node.get("metadata", {})
         return {
             "name": node.get("label", ""),
+            "module": _filepath_to_module(metadata.get("filepath", "")),
             "signature": metadata.get("signature", ""),
             "docstring": metadata.get("docstring", ""),
             "source_code": metadata.get("source_code", ""),
