@@ -303,7 +303,7 @@ class TestContextExtractor:
         visited_node_ids, traversed_edges = traversal.bfs(
             valid_seed_ids,
             self.engine.nodes_by_id,
-            self.engine.edges,
+            self.engine.kg['edges'],
             depth=depth,
             edge_filter=edge_filter,
             directions={"outgoing", "incoming"},
