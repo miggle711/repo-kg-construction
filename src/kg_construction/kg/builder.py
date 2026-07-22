@@ -20,7 +20,7 @@ Output format:
     {
         "nodes": [{"id": ..., "type": ..., "label": ..., "metadata": {...}}, ...],
         "edges": [{"source": ..., "target": ..., "relation": ..., "metadata": {...}}, ...],
-        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "parse_mode": "source"}
+        "metadata": {"repo": ..., "base_commit": ..., "file_count": ..., "parse_mode": "source", "schema_version": ...}
     }
 
 Usage:
@@ -87,6 +87,11 @@ SKIP_DIRS = {'docs', 'doc', 'examples', 'example', 'vendor', 'migrations', '.git
 
 # Files over this line count are skipped to avoid pathological parse times (e.g. generated files)
 MAX_FILE_LINES = 5000
+
+# Bumped whenever the KG node/edge shape changes. Stamped into every build's
+# metadata and checked on load, so a cached KG from an older schema is
+# rebuilt rather than silently served as if it matched the current shape.
+SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -1075,15 +1080,16 @@ class RepoKGBuilder:
 
     Orchestrates RepoManager (git operations) and RepoASTParser (source
     parsing) into a single build() call. Output is saved as JSON to
-    kg_output/kg_{repo}.json.
+    kg_output/kg_{repo}_{commit}.json -- keyed on both repo and commit, so
+    a KG built at one commit is never silently served for another.
 
     Example:
         builder = RepoKGBuilder()
         kg = builder.build('psf/requests', 'a0df2cbb...')
         builder.save('psf/requests', kg)
 
-        # Later
-        kg = builder.load('psf/requests')
+        # Later, same commit
+        kg = builder.load('psf/requests', 'a0df2cbb...')
         engine = KGQueryEngine(kg)
     """
 
@@ -1130,37 +1136,58 @@ class RepoKGBuilder:
             kg = self.ast_parser.parse_repo(repo, dest)
 
         kg['metadata']['base_commit'] = commit
+        kg['metadata']['schema_version'] = SCHEMA_VERSION
         return kg
 
-    def save(self, repo: str, kg: Dict):
-        """Serialize and save a KG to kg_output/kg_{repo}.json.
+    def _cache_path(self, repo: str, commit: str) -> Path:
+        """Return the on-disk cache path for a repo at a specific commit.
 
-        Slashes, dashes, and dots in repo names are replaced with underscores
-        to produce a safe filename.
+        Keyed on (repo, commit), not repo alone -- a KG built at one commit
+        must never be silently served for a different commit of the same
+        repo. Slashes, dashes, and dots in repo names are replaced with
+        underscores to produce a safe filename.
+        """
+        safe_name = repo.replace('/', '_').replace('-', '_').replace('.', '_')
+        return self.output_dir / f"kg_{safe_name}_{commit[:8]}.json"
+
+    def save(self, repo: str, kg: Dict):
+        """Serialize and save a KG to kg_output/kg_{repo}_{commit}.json.
 
         Args:
             repo: Repository name (used to derive the output filename).
-            kg: KG dict as returned by build().
+            kg: KG dict as returned by build(). Must have metadata.base_commit
+                set (build() sets this automatically).
         """
-        safe_name = repo.replace('/', '_').replace('-', '_').replace('.', '_')
-        output_file = self.output_dir / f"kg_{safe_name}.json"
+        commit = kg['metadata']['base_commit']
+        output_file = self._cache_path(repo, commit)
         with open(output_file, 'w') as f:
             json.dump(kg, f, indent=2)
-        print(f"Saved: {repo} -> {output_file} "
+        print(f"Saved: {repo}@{commit[:8]} -> {output_file} "
               f"({len(kg['nodes'])} nodes, {len(kg['edges'])} edges)")
 
-    def load(self, repo: str) -> Optional[Dict]:
-        """Load a previously saved KG from disk.
+    def load(self, repo: str, commit: str) -> Optional[Dict]:
+        """Load a previously saved KG from disk, for a specific commit.
+
+        A cached file is only returned if it exists AND its stamped
+        metadata.base_commit and metadata.schema_version both match what's
+        requested/current -- guards against a pre-#45 cache file (no
+        schema_version, or a filename collision) being served as if valid.
 
         Args:
             repo: Repository name (e.g. 'psf/requests').
+            commit: Commit SHA the caller needs the KG built at.
 
         Returns:
-            KG dict, or None if no saved KG exists for this repo.
+            KG dict, or None if no valid cached KG exists for this
+            (repo, commit) pair.
         """
-        safe_name = repo.replace('/', '_').replace('-', '_').replace('.', '_')
-        kg_file = self.output_dir / f"kg_{safe_name}.json"
-        if kg_file.exists():
-            with open(kg_file) as f:
-                return json.load(f)
-        return None
+        kg_file = self._cache_path(repo, commit)
+        if not kg_file.exists():
+            return None
+        with open(kg_file) as f:
+            kg = json.load(f)
+        if kg.get('metadata', {}).get('base_commit') != commit:
+            return None
+        if kg.get('metadata', {}).get('schema_version') != SCHEMA_VERSION:
+            return None
+        return kg

@@ -39,17 +39,22 @@ from kg_construction.llm.llm_serializer import LLMSerializer
 
 
 def _load_or_build(builder, repo, commit):
-    """Load existing KG or build+save a new one."""
-    try:
-        kg = builder.load(repo)
+    """Load an existing KG for (repo, commit) or build+save a new one.
+
+    load() returns None (never raises) on a cache miss -- including a
+    mismatched commit or an outdated schema_version, not just a missing
+    file -- so a None result always means "build fresh", not "error".
+    """
+    kg = builder.load(repo, commit)
+    if kg is not None:
         print(f"✓ Loaded existing KG")
         return kg
-    except FileNotFoundError:
-        print(f"Building KG for {repo} @ {commit[:8]}...", end=" ", flush=True)
-        kg = builder.build(repo, commit)
-        builder.save(repo, kg)
-        print(f"✓ Built and saved")
-        return kg
+
+    print(f"Building KG for {repo} @ {commit[:8]}...", end=" ", flush=True)
+    kg = builder.build(repo, commit)
+    builder.save(repo, kg)
+    print(f"✓ Built and saved")
+    return kg
 
 
 def serialize_context(context):
