@@ -50,6 +50,40 @@ class TestSerializeSeedSection:
         assert result["seed"]["module"] == ""
         assert result["seed"]["filepath"] == ""
 
+    def test_method_seed_includes_class_name(self):
+        """A method's class name (e.g. "Session") must be surfaced so the
+        LLM knows to import/instantiate the class rather than attempting a
+        bare "from module import method_name" import, which doesn't exist
+        for methods (see kg-test-generation issue #14).
+        """
+        seed_node = {
+            "id": "n1",
+            "label": "resolve_redirects",
+            "type": "method",
+            "metadata": {
+                "filepath": "requests/sessions.py",
+                "class": "Session",
+            },
+        }
+        result = LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": [], "edges": [], "test_nodes": []}
+        )
+
+        assert result["seed"]["class_name"] == "Session"
+
+    def test_function_seed_has_empty_class_name(self):
+        seed_node = {
+            "id": "n1",
+            "label": "get",
+            "type": "function",
+            "metadata": {"filepath": "requests/api.py"},
+        }
+        result = LLMSerializer().serialize(
+            {"seeds": [seed_node], "context_nodes": [], "edges": [], "test_nodes": []}
+        )
+
+        assert result["seed"]["class_name"] == ""
+
     def test_no_seeds_returns_empty_dict(self):
         result = LLMSerializer().serialize(
             {"seeds": [], "context_nodes": [], "edges": [], "test_nodes": []}
@@ -78,6 +112,20 @@ class TestSerializeContextSection:
         result = LLMSerializer().serialize(self._instance(seed_node, caller_node, "calls"))
 
         assert len(result["context"]["callers"]) == 1
+
+    def test_caller_includes_class_name_when_a_method(self):
+        seed_node = {
+            "id": "seed", "label": "send", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py"},
+        }
+        caller_node = {
+            "id": "caller", "label": "request", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py", "class": "Session"},
+        }
+        result = LLMSerializer().serialize(self._instance(seed_node, caller_node, "calls"))
+
+        assert result["context"]["callers"][0]["class_name"] == "Session"
+        assert result["context"]["callers"][0]["type"] == "method"
         assert result["context"]["callers"][0]["module"] == "requests.sessions"
         assert result["context"]["callers"][0]["name"] == "request"
 
