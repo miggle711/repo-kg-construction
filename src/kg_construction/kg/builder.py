@@ -761,7 +761,7 @@ class RepoASTParser:
 
             return [], 'unresolved'
 
-        def _resolve_call(meta: Dict, callee_name: str) -> Tuple[List[str], str]:
+        def _resolve_call(meta: Dict, callee_name: str, caller_filepath: Optional[str] = None) -> Tuple[List[str], str]:
             """Resolve a call-edge target using the metadata hints."""
             class_hint = meta.get('class_hint')
             if class_hint:
@@ -787,9 +787,43 @@ class RepoASTParser:
                         return hits, 'qualified'
 
             hits = label_to_ids.get(callee_name, [])
-            if not hits:
+
+            # A bare call (no receiver at all, e.g. `request(...)` calling
+            # a module-level function, as opposed to `x.request()`) that
+            # matches more than one same-named node: prefer the one(s) in
+            # the SAME FILE as the caller. A bare name in Python resolves
+            # via the caller's own module/import scope, so a same-file
+            # match is a real, principled preference, not a guess --
+            # confirmed necessary on a real psf/requests case: api.py's
+            # post() calls bare request(...), meaning api.py's OWN
+            # module-level request() function, but request also exists as
+            # unrelated methods on Session and RequestMethods in other
+            # files (kg_construction#65).
+            if len(hits) > 1 and meta.get('receiver') is None and caller_filepath:
+                same_file_hits = [
+                    hid for hid in hits
+                    if nodes_by_id.get(hid, {}).get('metadata', {}).get('filepath') == caller_filepath
+                ]
+                if len(same_file_hits) == 1:
+                    return same_file_hits, 'exact'
+
+            if len(hits) != 1:
+                # 0 hits: genuinely nothing in this repo has that name
+                # (very likely an external library/stdlib call, e.g.
+                # requests.get() or ConfigParser.get() -- neither is
+                # parsed into this KG, so there's nothing to link to).
+                # >1 hits (and same-file preference above didn't resolve
+                # it): no real hint resolved this call to a specific
+                # receiver, so linking it to EVERY same-named method in
+                # the repo is not a best-effort guess, it's simply wrong --
+                # confirmed on real django/django and psf/requests calls
+                # that had nothing to do with the arbitrary same-named
+                # method they'd have been linked to (kg_construction#65,
+                # a generalization of #61's super()-specific case; 80-93%
+                # of calls edges in both real repos hit this fallback).
+                # Drop rather than fan out to every candidate.
                 return [], 'unresolved'
-            return hits, 'exact' if len(hits) == 1 else 'ambiguous'
+            return hits, 'exact'
 
         resolved_edges: List[Dict] = []
         seen_edges: Set[Tuple] = set()
@@ -814,7 +848,8 @@ class RepoASTParser:
 
             if edge['relation'] == 'calls' and meta.get('unresolved'):
                 callee_name = edge['target']
-                matches, confidence = _resolve_call(meta, callee_name)
+                caller_filepath = nodes_by_id.get(edge['source'], {}).get('metadata', {}).get('filepath')
+                matches, confidence = _resolve_call(meta, callee_name, caller_filepath)
                 if not matches:
                     continue
                 for target_id in matches:
