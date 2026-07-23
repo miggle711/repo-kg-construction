@@ -228,3 +228,59 @@ class TestPatchParser:
         changed = PatchParser.extract_changed_functions(patch, 'mod.py')
         assert changed == {'changed'}
         assert 'untouched' not in changed
+
+    def test_falls_back_to_header_scope_name_when_def_line_not_in_hunk(self):
+        """kg_construction#60's second-repo check: when the changed lines
+        are deep enough inside a long function that its own 'def' line
+        falls outside the hunk's context window, the hunk body contains
+        no def/class line at all -- confirmed on a real django/django
+        patch (slugify()), where an identical semantic change was
+        detected or silently missed depending only on whether the def
+        line happened to be within context. git's own hunk-header trailing
+        text ('@@ ... @@ def name(...)') is the fallback signal for this
+        case.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -10,7 +10,7 @@ def long_function(value):
+     step_one = value
+     step_two = step_one + 1
+     step_three = step_two * 2
+-    return step_three
++    return step_three + 1
+"""
+        changed = PatchParser.extract_changed_functions(patch, 'mod.py')
+        assert changed == {'long_function'}
+
+    def test_header_scope_name_ignored_when_def_line_is_present(self):
+        """When the hunk body DOES contain a def/class line, the ordinary
+        body-based detection is authoritative -- the header hint must not
+        add a second, spurious name.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,5 +1,5 @@ def other_function():
+ def other_function():
+-    return 1
++    return 2
+"""
+        changed = PatchParser.extract_changed_functions(patch, 'mod.py')
+        assert changed == {'other_function'}
+
+    def test_header_scope_name_not_used_when_hunk_body_genuinely_unchanged(self):
+        """The header-hint fallback only applies when NO def/class line
+        appears in the hunk body at all -- if a def/class line IS present
+        but its body has no real change (pure context), the existing
+        no-genuine-change logic must still win; the header hint must not
+        override that by adding the name anyway via a different path.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,4 +1,4 @@ def untouched():
+ def untouched():
+     return 1
+-# comment removed below, outside the function
++# comment replaced below, outside the function
+"""
+        changed = PatchParser.extract_changed_functions(patch, 'mod.py')
+        assert 'untouched' not in changed

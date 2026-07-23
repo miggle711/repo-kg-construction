@@ -59,6 +59,12 @@ class PatchParser:
         current_file = None
         current_hunk: List[_HunkLine] = []
         pending_decorator = False
+        # git's own "which function/class is this hunk inside" hint, from
+        # the trailing text on an '@@ ... @@' line (e.g.
+        # '@@ -470,11 +470,11 @@ def slugify(value, allow_unicode=False):').
+        # Used as a fallback ONLY when the hunk body itself contains no
+        # def/class line at all -- see _extract_defs_from_hunk.
+        header_scope_name: Optional[str] = None
 
         lines = patch.split('\n')
         i = 0
@@ -70,10 +76,11 @@ class PatchParser:
                 # Process accumulated hunk for previous file before switching
                 if current_hunk:
                     pending_decorator = PatchParser._extract_defs_from_hunk(
-                        current_hunk, changed_names, pending_decorator
+                        current_hunk, changed_names, pending_decorator, header_scope_name
                     )
                 current_hunk = []
                 pending_decorator = False
+                header_scope_name = None
                 # Extract the file path from '+++ b/path'
                 match = re.match(r'^\+\+\+ b/(.+)$', line)
                 if match:
@@ -81,13 +88,14 @@ class PatchParser:
 
             # Within the target file, collect hunk lines
             if current_file == code_file:
-                # Hunk header: @@ -start,count +start,count @@
+                # Hunk header: @@ -start,count +start,count @@ [trailing context]
                 if line.startswith('@@'):
                     if current_hunk:
                         pending_decorator = PatchParser._extract_defs_from_hunk(
-                            current_hunk, changed_names, pending_decorator
+                            current_hunk, changed_names, pending_decorator, header_scope_name
                         )
                     current_hunk = []
+                    header_scope_name = PatchParser._extract_header_scope_name(line)
                 # Accumulate hunk lines: added, removed, or context.
                 # Removed ('-') lines are kept (unlike before) so body-change
                 # detection can see them; they carry no post-patch line
@@ -103,14 +111,48 @@ class PatchParser:
         # Process final hunk
         if current_hunk:
             PatchParser._extract_defs_from_hunk(
-                current_hunk, changed_names, pending_decorator
+                current_hunk, changed_names, pending_decorator, header_scope_name
             )
 
         return changed_names
 
     @staticmethod
+    def _extract_header_scope_name(header_line: str) -> Optional[str]:
+        """Extract the enclosing function/class name git prints as trailing
+        context on a hunk header line (e.g.
+        '@@ -470,11 +470,11 @@ def slugify(value, allow_unicode=False):'
+        -> 'slugify'), when git includes one.
+
+        This is git's own "which function is this hunk inside" hint,
+        computed from its diff context algorithm -- independent of and a
+        fallback for the def/class-line-matching this parser does over
+        the hunk body itself, which fails silently whenever the changed
+        lines are far enough into a long function that its own def line
+        falls outside the (small) context window and never appears as a
+        hunk body line at all. Confirmed via a real django/django patch
+        (slugify(), kg_construction#60's second-repo check): identical
+        semantic change, changed_functions came back empty purely because
+        the def line wasn't within context, and only non-empty once a
+        wider context window happened to include it.
+        """
+        # Only match a def/class-shaped trailing context, not arbitrary
+        # trailing text (git falls back to the nearest preceding non-blank
+        # line for other languages/heuristic misses, which isn't
+        # necessarily a function/class signature at all).
+        match = re.match(r'^@@[^@]*@@\s*(?:async\s+)?def\s+(\w+)\s*\(', header_line)
+        if match:
+            return match.group(1)
+        match = re.match(r'^@@[^@]*@@\s*class\s+(\w+)\s*[\(:]', header_line)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
     def _extract_defs_from_hunk(
-        hunk_lines: List[_HunkLine], names: Set[str], pending_decorator: bool
+        hunk_lines: List[_HunkLine],
+        names: Set[str],
+        pending_decorator: bool,
+        header_scope_name: Optional[str] = None,
     ) -> bool:
         """Extract function/class definitions genuinely changed within a hunk.
 
@@ -130,6 +172,14 @@ class PatchParser:
         decorator, is NOT added -- it's just visible because of the hunk's
         context window, not because it changed.
 
+        If the hunk body contains NO def/class line at all (the changed
+        lines are deep inside a function whose own def line falls outside
+        this hunk's context window -- confirmed to happen on real patches,
+        not just a theoretical edge case), header_scope_name (git's own
+        hint from the '@@ ... @@ def name(...)' trailing text) is used
+        instead: the hunk clearly changed SOMETHING, and this is the only
+        available signal for what function/class it's inside.
+
         Returns:
             True if a decorator is still pending resolution at the end of
             this hunk (i.e. no def/class line followed it), so the caller
@@ -139,7 +189,7 @@ class PatchParser:
         class_pattern = re.compile(r'^\s*class\s+(\w+)\s*[\(:]')
         decorator_pattern = re.compile(r'^\s*@\w')
 
-        n = len(hunk_lines)
+        saw_def_or_class = False
         for idx, hline in enumerate(hunk_lines):
             def_match = def_pattern.match(hline.content)
             class_match = class_pattern.match(hline.content)
@@ -149,6 +199,7 @@ class PatchParser:
                     pending_decorator = pending_decorator or hline.marker != ' '
                 continue
 
+            saw_def_or_class = True
             name = def_match.group(2) if def_match else class_match.group(1)
             own_line_changed = hline.marker != ' '
             decorator_changed = pending_decorator
@@ -158,6 +209,9 @@ class PatchParser:
                 names.add(name)
 
             pending_decorator = False
+
+        if not saw_def_or_class and header_scope_name is not None:
+            names.add(header_scope_name)
 
         return pending_decorator
 
