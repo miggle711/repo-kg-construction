@@ -143,7 +143,15 @@ class LLMSerializer:
         Returns dict with:
             - callers: Functions that call the seed
             - callees: Functions called by the seed
-            - related: Parent classes, subclasses, instantiations
+            - related: Classes the seed itself, or the seed's own class,
+              inherits from or instantiates (not any inherits/uses/
+              instantiates edge anywhere in the subgraph -- restricted to
+              edges sourced from the seed or its containing class, so this
+              reflects the seed's own relationships, not an unrelated
+              caller/callee/sibling's). Each entry's "source" field is
+              "seed" (the seed function/method itself) or "seed_class" (the
+              seed's owning class, e.g. via __init__) so the model can tell
+              the two apart.
             - sibling_methods: Other methods of the seed's own class (e.g.
               __init__, or a setup method like prepare()) -- context a
               flat single-function extraction (the baseline arm) can
@@ -193,22 +201,46 @@ class LLMSerializer:
             elif src_id in seed_ids and relation == "calls":
                 callees.append(self._node_to_snippet(tgt_node))
 
-            # Inheritance and composition
-            elif relation == "inherits":
+            # Inheritance and composition -- restricted to edges sourced from
+            # the seed itself OR the seed's own class (src_id in seed_ids or
+            # seed_class_ids), not just any inherits/uses/instantiates edge
+            # that happens to appear in the subgraph. Without this
+            # restriction, a caller/callee/sibling method that itself
+            # instantiates some class gets that fact attributed to "related"
+            # as if it were about the seed -- e.g. Session and Request both
+            # instantiate PreparedRequest somewhere in their own bodies,
+            # which produced 3 near-identical-looking "instantiation:
+            # PreparedRequest" entries for a seed (prepare_body) that
+            # doesn't itself instantiate PreparedRequest at all (see
+            # kg-test-generation#49's investigation -- the KG data/edges
+            # were correct, this was a serialization scoping bug, not real
+            # duplication or a bad graph). The seed's own class is included
+            # (not just the seed function/method itself) because a method
+            # inherits/instantiates via its class, not typically in its own
+            # body -- e.g. PreparedRequest.__init__ instantiating
+            # CaseInsensitiveDict is relevant to every method on
+            # PreparedRequest, not just __init__. `source` records which of
+            # the two applies so the model can tell "the seed does this
+            # directly" from "the seed's class does this elsewhere."
+            elif relation == "inherits" and (src_id in seed_ids or src_id in seed_class_ids):
                 related.append(
                     {
                         "type": "parent_class",
                         "name": tgt_node.get("label", ""),
                         "module": _filepath_to_module(tgt_node.get("metadata", {}).get("filepath", "")),
                         "source_code": tgt_node.get("metadata", {}).get("source_code", ""),
+                        "source": "seed" if src_id in seed_ids else "seed_class",
                     }
                 )
-            elif relation == "uses" or relation == "instantiates":
+            elif (relation == "uses" or relation == "instantiates") and (
+                src_id in seed_ids or src_id in seed_class_ids
+            ):
                 related.append(
                     {
                         "type": "instantiation",
                         "name": tgt_node.get("label", ""),
                         "module": _filepath_to_module(tgt_node.get("metadata", {}).get("filepath", "")),
+                        "source": "seed" if src_id in seed_ids else "seed_class",
                     }
                 )
 
