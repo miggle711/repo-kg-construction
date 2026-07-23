@@ -241,6 +241,11 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                                json.loads → 'json.loads')
             receiver:          raw receiver expression for attribute calls
                                (kept for debugging / future heuristics)
+            is_super_call:     True for super().method() -- resolved in pass 2
+                               against the caller's own inherits chain
+                               instead of the bare-name fallback, which used
+                               to link e.g. ErrorList.copy() to an unrelated
+                               class's copy() (kg_construction#61).
 
         Args:
             local_types: Precomputed _collect_local_types(func_node) result,
@@ -253,14 +258,26 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
             callee = _extract_callee_name(call)
             if not callee or (func_id, callee) in seen_call_targets:
                 continue
+
+            # super().method() parses as TWO Call nodes: the outer method
+            # call (handled below via is_super_call) and the inner one
+            # that constructs the super proxy itself (callee='super',
+            # receiver=None) -- not a real call, so it must not fall
+            # through to bare-name matching (kg_construction#61).
+            if callee == 'super' and _extract_call_receiver(call) is None:
+                continue
+
             seen_call_targets.add((func_id, callee))
 
             receiver = _extract_call_receiver(call)
             class_hint: Optional[str] = None
             local_type_hint: Optional[str] = None
             import_resolved: Optional[str] = None
+            is_super_call = receiver == 'super()'
 
-            if receiver == 'self' and class_name is not None:
+            if is_super_call:
+                pass  # resolved in pass 2 via the caller's own inherits chain
+            elif receiver == 'self' and class_name is not None:
                 class_hint = class_name
             elif receiver and receiver in local_types:
                 local_type_hint = local_types[receiver]
@@ -279,6 +296,7 @@ def _parse_file(args: Tuple[str, str, str]) -> Optional[Dict]:
                     'class_hint': class_hint,
                     'local_type_hint': local_type_hint,
                     'import_resolved': import_resolved,
+                    'is_super_call': is_super_call,
                 }
             )))
 
@@ -779,9 +797,20 @@ class RepoASTParser:
         # transitive base classes, so raw edges are collected here and
         # resolved in a dedicated pass after this loop finishes.
         pending_overrides: List[Dict] = []
+        # super().method() calls need the same deferred treatment: the
+        # caller's OWN class's 'inherits' edges aren't necessarily
+        # resolved yet at this point in the loop (kg_construction#61) --
+        # collected here, resolved in _resolve_super_calls once 'inherits'
+        # is fully populated, walking the real base-class chain instead of
+        # ever falling through to the bare-name fallback below.
+        pending_super_calls: List[Dict] = []
 
         for edge in all_edges:
             meta = edge.get('metadata', {})
+
+            if edge['relation'] == 'calls' and meta.get('unresolved') and meta.get('is_super_call'):
+                pending_super_calls.append(edge)
+                continue
 
             if edge['relation'] == 'calls' and meta.get('unresolved'):
                 callee_name = edge['target']
@@ -915,6 +944,8 @@ class RepoASTParser:
 
         self._resolve_overrides(pending_overrides, resolved_edges, indices, seen_edges)
 
+        self._resolve_super_calls(pending_super_calls, resolved_edges, indices, seen_edges)
+
         self._derive_tests_edges_from_calls(resolved_edges, nodes_by_id, seen_edges)
 
         # Add module_depends_on edges
@@ -1047,33 +1078,6 @@ class RepoASTParser:
             if edge['relation'] == 'inherits':
                 base_class_ids[edge['source']].append(edge['target'])
 
-        def _find_override_target(base_class_id: str, method_name: str) -> Optional[str]:
-            """BFS up the inheritance chain for the nearest method definition.
-
-            Returns the first matching method's node ID, or None if no
-            ancestor in the chain defines a method with this name. Tracks
-            visited classes to guard against cyclical/malformed inherits
-            edges (e.g. from ambiguous multi-match resolution).
-            """
-            visited: Set[str] = set()
-            frontier = [base_class_id]
-            while frontier:
-                next_frontier: List[str] = []
-                for class_id in frontier:
-                    if class_id in visited:
-                        continue
-                    visited.add(class_id)
-
-                    class_node = nodes_by_id.get(class_id)
-                    if class_node:
-                        hits = class_method_to_ids.get((class_node['label'], method_name), [])
-                        if hits:
-                            return hits[0]
-
-                    next_frontier.extend(base_class_ids.get(class_id, []))
-                frontier = next_frontier
-            return None
-
         for edge in pending_overrides:
             parts = edge['target'].rsplit('.', 1)
             if len(parts) != 2:
@@ -1082,7 +1086,9 @@ class RepoASTParser:
             base_simple = base_name.split('.')[-1]
 
             for base_class_id in class_label_to_ids.get(base_simple, []):
-                target_id = _find_override_target(base_class_id, method_name)
+                target_id = self._find_nearest_ancestor_method(
+                    base_class_id, method_name, base_class_ids, class_method_to_ids, nodes_by_id
+                )
                 if target_id is None:
                     continue
                 key = (edge['source'], target_id, 'overrides')
@@ -1092,6 +1098,107 @@ class RepoASTParser:
                         source=edge['source'], target=target_id,
                         relation='overrides'
                     )))
+
+    @staticmethod
+    def _find_nearest_ancestor_method(
+        base_class_id: str,
+        method_name: str,
+        base_class_ids: Dict[str, List[str]],
+        class_method_to_ids: Dict[Tuple[str, str], List[str]],
+        nodes_by_id: Dict[str, Dict],
+    ) -> Optional[str]:
+        """BFS up an inheritance chain for the nearest ancestor defining
+        method_name, starting from base_class_id. Returns its node ID, or
+        None if no ancestor defines it. Guards against cycles via `visited`.
+
+        Shared by _resolve_overrides ('overrides') and _resolve_super_calls
+        (kg_construction#61, "what does super().method() call") -- same
+        question, two different relations.
+        """
+        visited: Set[str] = set()
+        frontier = [base_class_id]
+        while frontier:
+            next_frontier: List[str] = []
+            for class_id in frontier:
+                if class_id in visited:
+                    continue
+                visited.add(class_id)
+
+                class_node = nodes_by_id.get(class_id)
+                if class_node:
+                    hits = class_method_to_ids.get((class_node['label'], method_name), [])
+                    if hits:
+                        return hits[0]
+
+                next_frontier.extend(base_class_ids.get(class_id, []))
+            frontier = next_frontier
+        return None
+
+    def _resolve_super_calls(
+        self,
+        pending_super_calls: List[Dict],
+        resolved_edges: List[Dict],
+        indices: Dict,
+        seen_edges: Set[Tuple],
+    ) -> None:
+        """Resolve super().method() calls against the caller's own
+        inheritance chain (kg_construction#61), instead of the bare-name
+        fallback in _resolve_call -- which used to match e.g.
+        ErrorList.copy() to some unrelated class's copy() method.
+
+        Walks the caller's class's own (already-resolved) inherits chain
+        for the nearest ancestor defining the method, same as
+        _resolve_overrides. If no parsed ancestor defines it (e.g. the
+        real base is an unparsed builtin like list), the edge is dropped
+        rather than guessed. Requires 'inherits' edges already resolved,
+        same precondition as _resolve_overrides.
+        """
+        if not pending_super_calls:
+            return
+
+        class_label_to_ids = indices['class_label_to_ids']
+        class_method_to_ids = indices['class_method_to_ids']
+        nodes_by_id = indices['nodes_by_id']
+
+        base_class_ids: Dict[str, List[str]] = defaultdict(list)
+        for edge in resolved_edges:
+            if edge['relation'] == 'inherits':
+                base_class_ids[edge['source']].append(edge['target'])
+
+        for edge in pending_super_calls:
+            caller_node = nodes_by_id.get(edge['source'])
+            if not caller_node:
+                continue
+            caller_class_name = caller_node.get('metadata', {}).get('class')
+            caller_filepath = caller_node.get('metadata', {}).get('filepath')
+            if not caller_class_name:
+                continue  # super() outside a class isn't valid Python
+
+            # class_label_to_ids can return multiple candidates for a
+            # common class name across files -- narrow to the caller's own
+            # file, falling back to all candidates if none match.
+            candidates = class_label_to_ids.get(caller_class_name, [])
+            same_file_candidates = [
+                cid for cid in candidates
+                if nodes_by_id.get(cid, {}).get('metadata', {}).get('filepath') == caller_filepath
+            ]
+            caller_class_ids = same_file_candidates or candidates
+
+            method_name = edge['target']
+            for caller_class_id in caller_class_ids:
+                for base_class_id in base_class_ids.get(caller_class_id, []):
+                    target_id = self._find_nearest_ancestor_method(
+                        base_class_id, method_name, base_class_ids, class_method_to_ids, nodes_by_id
+                    )
+                    if target_id is None:
+                        continue
+                    key = (edge['source'], target_id, 'calls')
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        resolved_edges.append(asdict(KGEdge(
+                            source=edge['source'], target=target_id, relation='calls',
+                            metadata={'confidence': 'qualified', 'via': 'super'}
+                        )))
 
     def _add_call_context(self, all_nodes: List[Dict], all_edges: List[Dict]) -> None:
         """Annotate functions with caller_count and direct_callers metadata."""
