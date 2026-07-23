@@ -161,8 +161,14 @@ class TestContextExtractor:
             # Exclude depends_on (imports) as noise; include structural edges only
             edge_filter = {'contains', 'calls', 'accesses', 'inherits', 'tests', 'uses'}
 
-        # Extract changed function/class names from the patch
-        changed_names = self.patch_parser.extract_changed_functions(
+        # Extract changed function/class names from the patch, with the
+        # enclosing class name too when the diff hunk makes it available
+        # (kg_construction#63): a bare name can match more than one class'
+        # same-named method in the same file (e.g. a real encode/httpx
+        # patch to AsyncClient.aclose also matched the unrelated
+        # BoundAsyncStream.aclose) -- the class hint, when known, resolves
+        # that instead of adding every same-named match as a seed.
+        changed = self.patch_parser.extract_changed_functions_with_scope(
             instance['patch'],
             instance['code_file']
         )
@@ -175,12 +181,34 @@ class TestContextExtractor:
 
         # Find seed nodes: changed functions in code_file
         seed_ids: List[str] = []
-        for name in changed_names:
+        for name, enclosing_class in changed:
             funcs = self.engine.find_function_by_name(name)
             # Filter to only those in the code_file
-            for func in funcs:
-                if func['metadata'].get('filepath') == instance['code_file']:
-                    seed_ids.append(func['id'])
+            matches = [
+                func for func in funcs
+                if func['metadata'].get('filepath') == instance['code_file']
+            ]
+            # When the name alone is ambiguous (>1 match in this file) AND
+            # the diff told us which class it belongs to, narrow to that
+            # class -- otherwise every same-named match becomes a seed,
+            # and LLMSerializer._build_seed_section's seeds[0] would show
+            # the model an arbitrary one of them (same failure shape as
+            # #54's test-file-as-seed defect). If the class hint doesn't
+            # narrow it to exactly one match (e.g. the hint wasn't
+            # available, or somehow still ambiguous), fall through with
+            # all matches unfiltered -- TestContextValidator's
+            # _check_no_ambiguous_seed_names is the backstop that refuses
+            # to silently proceed with an unresolved collision.
+            if len(matches) > 1 and enclosing_class is not None:
+                narrowed = [
+                    func for func in matches
+                    if func['metadata'].get('class') == enclosing_class
+                ]
+                if len(narrowed) == 1:
+                    matches = narrowed
+
+            for func in matches:
+                seed_ids.append(func['id'])
 
         # If no changed functions found, use the code_file itself as seed
         if not seed_ids:

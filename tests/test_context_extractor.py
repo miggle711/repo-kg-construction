@@ -244,3 +244,106 @@ class TestCallsBasedTestDetection:
 
         test_labels = {t["label"] for t in context.test_nodes}
         assert "test_covers_unrelated_function" not in test_labels
+
+
+class TestAmbiguousSeedNameDisambiguation:
+    """kg_construction#63: a changed method name can match more than one
+    class' same-named method in the same file -- found via a real
+    encode/httpx patch to AsyncClient.aclose, which also matched the
+    unrelated BoundAsyncStream.aclose in the same file. extract() must
+    use the patch's own class-scope hint (when available) to resolve
+    this to the correct single node, rather than adding every same-named
+    match as a seed and leaving LLMSerializer._build_seed_section to
+    non-deterministically pick one via seeds[0].
+    """
+
+    def _write_repo_with_name_collision(self, tmp_path: Path) -> Path:
+        (tmp_path / "mod.py").write_text(
+            "class Alpha:\n"
+            "    def aclose(self):\n"
+            "        return 1\n"
+            "\n"
+            "class Beta:\n"
+            "    def aclose(self):\n"
+            "        return 2\n"
+        )
+        return tmp_path
+
+    def test_class_hint_from_hunk_resolves_the_collision(self, tmp_path):
+        repo_dir = self._write_repo_with_name_collision(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine)
+
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -1,4 +1,5 @@\n"
+            " class Alpha:\n"
+            "     def aclose(self):\n"
+            "-        return 1\n"
+            "+        return 10\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+
+        assert len(context.seeds) == 1
+        assert context.seeds[0]["label"] == "aclose"
+        assert context.seeds[0]["metadata"].get("class") == "Alpha"
+
+    def test_no_class_hint_available_leaves_ambiguity_for_the_validator(self, tmp_path):
+        """When the patch's changed-function detection falls back to the
+        header-scope-NAME hint (no def/class line in the hunk body at
+        all, per #62) and that header carries no class trailing context
+        either, extract() has no information to disambiguate with -- both
+        same-named matches end up as seeds. This is intentional: it's
+        exactly the case TestContextValidator._check_no_ambiguous_seed_names
+        exists to catch as a blocking error, not something extract() can
+        resolve without more information than the diff provides.
+        """
+        repo_dir = self._write_repo_with_name_collision(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine)
+
+        # Hunk header has no trailing context at all (no def/class name),
+        # and the hunk body has no def/class line either -- changed-name
+        # detection can only fall back to... nothing resolvable, so this
+        # patch is deliberately a case where NEITHER seed can be found by
+        # name at all. Use a differently-shaped repro instead: a patch
+        # whose header names the FUNCTION (not a class), so extract()
+        # falls into the header_scope_name path with header_scope_class
+        # left None (no class trailing context in this particular header).
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -2,4 +2,5 @@ def aclose(self):\n"
+            "     def aclose(self):\n"
+            "         return 1\n"
+            "+        return 10\n"
+        )
+        instance = {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+        context = extractor.extract(instance, depth=2)
+
+        # No class hint was resolvable, so BOTH same-named matches are
+        # seeds -- exactly the ambiguity the validator must catch.
+        seed_labels = [s["label"] for s in context.seeds]
+        assert seed_labels.count("aclose") == 2

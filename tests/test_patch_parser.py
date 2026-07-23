@@ -284,3 +284,117 @@ class TestPatchParser:
 """
         changed = PatchParser.extract_changed_functions(patch, 'mod.py')
         assert 'untouched' not in changed
+
+
+class TestExtractChangedFunctionsWithScope:
+    """kg_construction#63: a changed method name can match more than one
+    class' same-named method in the same file (found via a real
+    encode/httpx patch to AsyncClient.aclose, which also matched the
+    unrelated BoundAsyncStream.aclose). extract_changed_functions_with_scope
+    reports the enclosing class alongside each name, when it can be
+    determined, so TestContextExtractor can disambiguate instead of
+    adding every same-named match as a seed.
+    """
+
+    def test_class_line_in_hunk_body_is_tracked_as_enclosing_class(self):
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,6 +1,7 @@
+ class Widget:
+     def build(self):
+         return self.helper()
++        # a comment
+"""
+        changed = PatchParser.extract_changed_functions_with_scope(patch, 'mod.py')
+        assert ('build', 'Widget') in changed
+
+    def test_header_class_hint_used_when_class_line_not_in_hunk_body(self):
+        """kg_construction#63's actual reproducing shape: the hunk is deep
+        enough into a class's body that 'class X:' never appears as a hunk
+        BODY line, but git's header still reports it as trailing context.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -50,6 +50,7 @@ class Widget:
+     def build(self):
+         return self.helper()
++        return None
+"""
+        changed = PatchParser.extract_changed_functions_with_scope(patch, 'mod.py')
+        assert ('build', 'Widget') in changed
+
+    def test_no_class_information_available_reports_none(self):
+        """A top-level function has no enclosing class at all -- must
+        report None, not omit the entry or raise.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,3 +1,4 @@
+ def standalone():
+     return 1
++    # comment
+"""
+        changed = PatchParser.extract_changed_functions_with_scope(patch, 'mod.py')
+        assert ('standalone', None) in changed
+
+    def test_class_scope_does_not_leak_across_dedent(self):
+        """A def AFTER the class body has ended (dedented back to module
+        level) must not be attributed to that class.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,8 +1,9 @@
+ class Widget:
+     def build(self):
+         return 1
+
+ def standalone():
+     return 2
++    # comment
+"""
+        changed = PatchParser.extract_changed_functions_with_scope(patch, 'mod.py')
+        assert ('standalone', None) in changed
+        assert ('standalone', 'Widget') not in changed
+
+    def test_two_classes_same_method_name_get_different_scopes(self):
+        """The exact ambiguity #63 was found from: two unrelated classes
+        each define a method with the same name, in the same file/hunk.
+        Both must be reported, each with its OWN correct enclosing class.
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,10 +1,12 @@
+ class Alpha:
+     def aclose(self):
+         return 1
++        # comment
+
+ class Beta:
+     def aclose(self):
+         return 2
++        # comment
+"""
+        changed = PatchParser.extract_changed_functions_with_scope(patch, 'mod.py')
+        assert ('aclose', 'Alpha') in changed
+        assert ('aclose', 'Beta') in changed
+
+    def test_flat_extract_changed_functions_still_returns_bare_names(self):
+        """extract_changed_functions (the original, still-used-elsewhere
+        method) must keep returning a flat Set[str] -- existing callers
+        (resolve_target_function, build_baseline_context) depend on this
+        shape and must not need to change. (Both 'Widget' and 'build' are
+        expected here: a change nested inside a method's body is, by the
+        existing body-change-detection logic, also a change within the
+        enclosing class's own body -- unrelated to this fix, unchanged
+        from before it.)
+        """
+        patch = """--- a/mod.py
++++ b/mod.py
+@@ -1,3 +1,4 @@
+ class Widget:
+     def build(self):
+         return 1
++        # comment
+"""
+        changed = PatchParser.extract_changed_functions(patch, 'mod.py')
+        assert changed == {'Widget', 'build'}
