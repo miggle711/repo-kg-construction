@@ -268,3 +268,65 @@ class TestTestContextValidator:
         is_valid, report = validator.validate()
         assert 'Seeds:' in report or 'seeds' in report.lower()
         assert 'Context:' in report or 'context' in report.lower()
+
+    def test_same_named_seeds_in_different_classes_is_flagged(self):
+        """kg_construction#63: a changed function name that resolves to
+        more than one distinct node (e.g. two unrelated classes each
+        defining their own 'aclose' method, found via a real encode/httpx
+        patch to AsyncClient.aclose that also matched the unrelated
+        BoundAsyncStream.aclose in the same file) must be flagged as an
+        error -- LLMSerializer._build_seed_section trusts seeds[0]
+        unconditionally, so an unresolved collision means the model may
+        be shown a completely unrelated function as if it were the seed.
+        """
+        context = TestContext(
+            seeds=[
+                {'id': 's1', 'label': 'aclose', 'type': 'method',
+                 'metadata': {'filepath': 'client.py', 'class': 'AsyncClient'}},
+                {'id': 's2', 'label': 'aclose', 'type': 'method',
+                 'metadata': {'filepath': 'client.py', 'class': 'BoundAsyncStream'}},
+            ],
+            context_nodes=[
+                {'id': 'c1', 'label': 'helper', 'type': 'function', 'metadata': {'filepath': 'client.py'}},
+            ],
+            edges=[
+                {'source': 's1', 'target': 'c1', 'relation': 'calls'},
+                {'source': 's2', 'target': 'c1', 'relation': 'calls'},
+            ],
+            test_nodes=[],
+            repo='test/repo',
+            base_commit='abc123def456',
+        )
+        validator = TestContextValidator(context)
+        is_valid, report = validator.validate()
+        assert is_valid is False
+        assert 'aclose' in report
+        assert 'Ambiguous' in report or 'ambiguous' in report.lower()
+
+    def test_genuine_multi_function_patch_is_not_flagged(self):
+        """A real multi-function patch (different labels, e.g.
+        api_multi_verb_2012 changing patch/put/request/post together)
+        must NOT be flagged -- the signal is specifically the SAME label
+        resolving to multiple nodes, not 'more than one seed' in general.
+        """
+        context = TestContext(
+            seeds=[
+                {'id': 's1', 'label': 'patch', 'type': 'method', 'metadata': {'filepath': 'api.py'}},
+                {'id': 's2', 'label': 'put', 'type': 'method', 'metadata': {'filepath': 'api.py'}},
+                {'id': 's3', 'label': 'post', 'type': 'method', 'metadata': {'filepath': 'api.py'}},
+            ],
+            context_nodes=[
+                {'id': 'c1', 'label': 'request', 'type': 'function', 'metadata': {'filepath': 'api.py'}},
+            ],
+            edges=[
+                {'source': 's1', 'target': 'c1', 'relation': 'calls'},
+                {'source': 's2', 'target': 'c1', 'relation': 'calls'},
+                {'source': 's3', 'target': 'c1', 'relation': 'calls'},
+            ],
+            test_nodes=[],
+            repo='test/repo',
+            base_commit='abc123def456',
+        )
+        validator = TestContextValidator(context)
+        is_valid, report = validator.validate()
+        assert is_valid is True
