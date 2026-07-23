@@ -173,12 +173,6 @@ class TestContextExtractor:
             raise ValueError(f"Code file not found: {instance['code_file']}")
         code_file_node = code_file_results[0]
 
-        # Find test file node (may not exist in KG)
-        test_file_node = None
-        test_file_results = self.engine.find_file_by_path(instance['test_file'])
-        if test_file_results:
-            test_file_node = test_file_results[0]
-
         # Find seed nodes: changed functions in code_file
         seed_ids: List[str] = []
         for name in changed_names:
@@ -192,9 +186,23 @@ class TestContextExtractor:
         if not seed_ids:
             seed_ids = [code_file_node['id']]
 
-        # Add test file as seed if it exists
-        if test_file_node:
-            seed_ids.append(test_file_node['id'])
+        # The test file itself is NOT a seed -- a seed is something to
+        # generate a test FOR, and the test file is existing test content,
+        # already surfaced separately via test_nodes ('tests' edges,
+        # extracted below). It used to be appended to seed_ids here, but
+        # subgraph_nodes' order (which context.seeds is derived from) comes
+        # from BFS visited-node order, not seed_ids' construction order --
+        # so this was non-deterministic, and when the test file landed at
+        # seeds[0], LLMSerializer._build_seed_section's `seeds[0]` picked
+        # the test file (empty signature/source_code) instead of the real
+        # target function, silently starving the LLM-augmented arm of the
+        # seed's actual code on roughly a third of instances/runs (see
+        # kg-test-generation#49's investigation, kg_construction#54).
+        # Nothing needs the test file in seed_ids for BFS reachability
+        # either: 'tests' edges point FROM the test function TO the seed
+        # (see builder.py's edge construction), so BFS from the seed alone
+        # (with incoming-direction traversal, already enabled) reaches the
+        # test function without the test file needing to be a seed itself.
 
         # BFS to extract subgraph
         subgraph_nodes, subgraph_edges = self._bfs(
