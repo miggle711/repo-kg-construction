@@ -170,6 +170,7 @@ class TestSerializeContextSection:
         assert len(related) == 1
         assert related[0]["type"] == "parent_class"
         assert related[0]["module"] == "requests.sessions"
+        assert related[0]["source"] == "seed"
 
     def test_instantiation_includes_module(self):
         seed_node = {
@@ -192,6 +193,94 @@ class TestSerializeContextSection:
         assert len(related) == 1
         assert related[0]["type"] == "instantiation"
         assert related[0]["module"] == "requests.adapters"
+        assert related[0]["source"] == "seed"
+
+
+class TestRelatedScopedToSeedOrSeedClass:
+    """Issue #49: 'related' previously iterated ALL inherits/uses/
+    instantiates edges in the subgraph, so a caller/callee/sibling method
+    that itself instantiated some class had that fact misattributed to the
+    seed -- e.g. Session and Request both instantiate PreparedRequest
+    somewhere in their own bodies, producing repeated "instantiation:
+    PreparedRequest" entries for a seed (prepare_body) that doesn't itself
+    instantiate PreparedRequest at all. Restricted to edges sourced from
+    the seed itself OR the seed's own class (a method's class typically
+    does inheritance/instantiation in __init__, not the method's own body).
+    """
+
+    def _method_seed_instance(self, extra_edges, extra_nodes=None):
+        seed_node = {
+            "id": "seed", "label": "prepare_body", "type": "method",
+            "metadata": {"filepath": "requests/models.py", "class": "PreparedRequest"},
+        }
+        class_node = {
+            "id": "class_preparedrequest", "label": "PreparedRequest", "type": "class",
+            "metadata": {"filepath": "requests/models.py"},
+        }
+        return {
+            "seeds": [seed_node],
+            "context_nodes": [class_node] + (extra_nodes or []),
+            "edges": [
+                {"source": class_node["id"], "target": seed_node["id"], "relation": "contains"},
+            ] + extra_edges,
+            "test_nodes": [],
+        }
+
+    def test_instantiation_sourced_from_seed_class_is_included(self):
+        used_node = {
+            "id": "used", "label": "CaseInsensitiveDict", "type": "class",
+            "metadata": {"filepath": "requests/structures.py"},
+        }
+        instance = self._method_seed_instance(
+            extra_edges=[{"source": "class_preparedrequest", "target": "used", "relation": "instantiates"}],
+            extra_nodes=[used_node],
+        )
+        result = LLMSerializer().serialize(instance)
+
+        related = result["context"]["related"]
+        assert len(related) == 1
+        assert related[0]["name"] == "CaseInsensitiveDict"
+        assert related[0]["source"] == "seed_class"
+
+    def test_inherits_sourced_from_seed_class_is_included(self):
+        parent_node = {
+            "id": "parent", "label": "RequestEncodingMixin", "type": "class",
+            "metadata": {"filepath": "requests/models.py"},
+        }
+        instance = self._method_seed_instance(
+            extra_edges=[{"source": "class_preparedrequest", "target": "parent", "relation": "inherits"}],
+            extra_nodes=[parent_node],
+        )
+        result = LLMSerializer().serialize(instance)
+
+        related = result["context"]["related"]
+        assert len(related) == 1
+        assert related[0]["name"] == "RequestEncodingMixin"
+        assert related[0]["source"] == "seed_class"
+
+    def test_instantiation_sourced_from_unrelated_node_is_excluded(self):
+        """A caller/callee/sibling's own instantiation must NOT leak into
+        the seed's 'related' list just because it appears in the subgraph
+        -- this is the exact bug #49 identified.
+        """
+        caller_node = {
+            "id": "caller", "label": "prepare", "type": "method",
+            "metadata": {"filepath": "requests/sessions.py", "class": "Session"},
+        }
+        used_node = {
+            "id": "used", "label": "PreparedRequest", "type": "class",
+            "metadata": {"filepath": "requests/models.py"},
+        }
+        instance = self._method_seed_instance(
+            extra_edges=[
+                {"source": "caller", "target": "seed", "relation": "calls"},
+                {"source": "caller", "target": "used", "relation": "instantiates"},
+            ],
+            extra_nodes=[caller_node, used_node],
+        )
+        result = LLMSerializer().serialize(instance)
+
+        assert result["context"]["related"] == []
 
 
 class TestSiblingMethods:
