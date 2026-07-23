@@ -915,6 +915,8 @@ class RepoASTParser:
 
         self._resolve_overrides(pending_overrides, resolved_edges, indices, seen_edges)
 
+        self._derive_tests_edges_from_calls(resolved_edges, nodes_by_id, seen_edges)
+
         # Add module_depends_on edges
         # Keyed by full relative path (e.g. 'pkg_a/utils.py'), not bare filename,
         # so same-named files in different packages (pkg_a/utils.py vs
@@ -953,6 +955,54 @@ class RepoASTParser:
                     break
 
         return resolved_edges
+
+    def _derive_tests_edges_from_calls(
+        self,
+        resolved_edges: List[Dict],
+        nodes_by_id: Dict,
+        seen_edges: Set[Tuple],
+    ) -> None:
+        """Add a 'tests' edge for every resolved 'calls' edge sourced from a
+        test_function node, in addition to the naming-convention 'tests'
+        edges resolved earlier in this pass (test_<name> -> <name>, exact
+        string match after stripping the prefix).
+
+        The naming heuristic assumes a test's name mechanically derives
+        from the function it tests -- true for some codebases, but checked
+        directly against psf/requests' real test suite and found to hold
+        for only 1 of 159 test functions (the rest use descriptive names
+        like test_prepared_request_hook, with no derivable relationship to
+        the function under test). That made existing_tests/test_nodes
+        empty for 21 of 22 real benchmark instances, not because no
+        relevant test existed, but because the only detection mechanism
+        couldn't see it (kg_construction#57's audit).
+
+        A test function that actually CALLS the target function is a much
+        stronger, naming-independent signal that it's a real existing test
+        for that function -- and this KG already computes exactly that via
+        the ordinary 'calls' edge resolution above, so this only needs to
+        re-tag test_function-sourced calls edges as also being 'tests'
+        edges, not build any new resolution machinery.
+
+        Mutates resolved_edges/seen_edges in place (same pattern as the
+        rest of this pass) rather than returning a new list.
+        """
+        for edge in list(resolved_edges):
+            if edge['relation'] != 'calls':
+                continue
+            src_node = nodes_by_id.get(edge['source'])
+            if not src_node or src_node.get('type') != 'test_function':
+                continue
+
+            key = (edge['source'], edge['target'], 'tests')
+            if key in seen_edges:
+                continue
+            seen_edges.add(key)
+            resolved_edges.append(asdict(KGEdge(
+                source=edge['source'], target=edge['target'], relation='tests',
+                metadata={'confidence': edge.get('metadata', {}).get('confidence', 'unknown'),
+                          'derived_from': 'calls'}
+            )))
 
     def _resolve_overrides(
         self,
