@@ -141,41 +141,79 @@ class KGValidator(ValidationBase):
             )
 
     def _check_metadata_consistency(self) -> None:
-        """Verify critical metadata keys are consistent within each node type."""
+        """Verify each node type's metadata has its expected keys, AND that
+        those keys actually hold real content (not just present-but-empty).
+
+        Previously checked only a hardcoded {'filepath'} against every node
+        type, ignoring _expected_metadata_keys entirely -- which already
+        correctly declares 'signature' as expected for function/method/
+        test_function nodes, but nothing ever consulted it. That's exactly
+        the shape of kg-test-generation#51's bug (signature/source_code
+        never computed for any function/method -- an empty string, not a
+        missing key, so even a present-vs-missing check would have missed
+        it): this validator had the right expectations table sitting right
+        next to the fix location the whole time and never used it.
+
+        Also: previously warned only if >50% of nodes in a type were
+        affected, which would catch a repo-wide bug like #51 (100%
+        affected) but miss a narrower one affecting a minority of nodes.
+        Any affected node now produces a warning (capped to the first 3
+        reported, to keep the report readable) -- there's no threshold
+        below which missing a function's real signature/source_code is
+        fine to stay silent about.
+        """
         by_type: Dict[str, List[Dict]] = defaultdict(list)
         for node in self.nodes:
             by_type[node['type']].append(node)
-
-        # Only check critical fields (filepath is always expected)
-        critical_keys = {'filepath'}
 
         for node_type, nodes in by_type.items():
             if not nodes:
                 continue
 
+            expected_keys = self._expected_metadata_keys(node_type)
+            if not expected_keys:
+                continue
+
             inconsistent = []
             for node in nodes:
                 meta = node.get('metadata', {})
-                missing = critical_keys - set(meta.keys())
-                if missing:
-                    inconsistent.append((node['label'], missing))
+                # A key that exists but holds an empty/falsy value (e.g.
+                # signature: "") is exactly as useless to the LLM as a
+                # missing key -- both mean "no real information here" --
+                # so check truthiness, not just key presence.
+                bad_keys = {k for k in expected_keys if not meta.get(k)}
+                if bad_keys:
+                    inconsistent.append((node['label'], bad_keys))
 
-            if inconsistent and len(inconsistent) > len(nodes) * 0.5:
-                # Warn only if >50% of nodes are missing critical fields
-                labels_missing = [f"{l}: {m}" for l, m in inconsistent[:2]]
+            if inconsistent:
+                labels_missing = [f"{l}: {m}" for l, m in inconsistent[:3]]
                 self.warnings.append(
-                    f"{node_type} metadata missing critical keys: {', '.join(labels_missing)}"
+                    f"{node_type} metadata missing/empty expected keys "
+                    f"({len(inconsistent)}/{len(nodes)}): {', '.join(labels_missing)}"
+                    f"{'...' if len(inconsistent) > 3 else ''}"
                 )
 
     def _expected_metadata_keys(self, node_type: str) -> Set[str]:
-        """Return expected metadata keys for a given node type."""
+        """Return expected metadata keys for a given node type.
+
+        'file'/'test_file' nodes use metadata['path'] (see
+        RepoASTParser.parse_repo's file-node construction), while
+        function/method/class nodes use metadata['filepath'] -- two
+        different conventions for two different node categories, not a
+        typo in one or the other. Declaring 'filepath' for file/test_file
+        here (as this previously did) meant _check_metadata_consistency
+        would have flagged every single file/test_file node in every KG,
+        100% of the time, the moment it was actually wired up to check
+        real expected keys instead of a hardcoded {'filepath'} -- caught
+        by running the strengthened check against the real dataset.
+        """
         expectations = {
             'function': {'signature', 'filepath'},
             'method': {'signature', 'filepath'},
             'test_function': {'signature', 'filepath'},
             'class': {'filepath'},
-            'file': {'filepath'},
-            'test_file': {'filepath'},
+            'file': {'path'},
+            'test_file': {'path'},
         }
         return expectations.get(node_type, set())
 
