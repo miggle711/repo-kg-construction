@@ -144,14 +144,34 @@ class LLMSerializer:
             - callers: Functions that call the seed
             - callees: Functions called by the seed
             - related: Parent classes, subclasses, instantiations
+            - sibling_methods: Other methods of the seed's own class (e.g.
+              __init__, or a setup method like prepare()) -- context a
+              flat single-function extraction (the baseline arm) can
+              never provide, since it has no notion of "what else does
+              this class define" (see issue #50 in kg-test-generation).
             - existing_tests: Test functions that reference the seed
             - patterns: Control flow, type hints, error handling patterns
         """
         seed_ids = {s["id"] for s in seeds}
 
+        # The class (if any) that directly contains a seed -- found via a
+        # 'contains' edge from a class node to the seed itself. Needed to
+        # tell "sibling method of the seed's own class" apart from any
+        # other class->method contains edge that might appear in the
+        # subgraph (e.g. via an unrelated 'related' class reached through
+        # inheritance/instantiation).
+        seed_class_ids = {
+            edge["source"]
+            for edge in edges
+            if edge.get("relation") == "contains"
+            and edge["target"] in seed_ids
+            and node_by_id.get(edge["source"], {}).get("type") == "class"
+        }
+
         callers = []
         callees = []
         related = []
+        sibling_methods = []
         existing_tests = []
 
         # Extract relationships from edges
@@ -192,6 +212,19 @@ class LLMSerializer:
                     }
                 )
 
+            # Other methods on the seed's own class -- e.g. __init__ or a
+            # setup method (prepare()) whose side effects the seed's own
+            # body depends on but doesn't itself set up. Excludes the
+            # seed's own containment edge (tgt_id in seed_ids) so the
+            # seed doesn't list itself as its own sibling.
+            elif (
+                relation == "contains"
+                and src_id in seed_class_ids
+                and tgt_id not in seed_ids
+                and tgt_node.get("type") in ("method", "function")
+            ):
+                sibling_methods.append(self._node_to_snippet(tgt_node))
+
         # Extract test functions
         for test_node in test_nodes:
             existing_tests.append(
@@ -208,6 +241,7 @@ class LLMSerializer:
             "callers": callers,
             "callees": callees,
             "related": related,
+            "sibling_methods": sibling_methods,
             "existing_tests": existing_tests,
             "patterns": patterns,
         }
