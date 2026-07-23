@@ -79,7 +79,38 @@ def serialize_context(context):
     return serializer.serialize(context_dict)
 
 
-def extract_and_validate(instance, depth=2, verbose=True):
+def _handle_validation_result(is_valid, report, repo, commit, verbose, strict):
+    """Make a TestContextValidator result impossible to silently ignore.
+
+    Split out from extract_and_validate so it's unit-testable without a
+    real KG build (which requires a network clone via RepoManager) -- see
+    kg_construction#54: TestContextValidator already had a check
+    (_check_seed_types) that would have caught the test-file-as-seed bug
+    every time it happened, but nothing ever surfaced it: extract_and_validate
+    only printed the report when verbose=True, kg-test-generation's caller
+    passed verbose=False and discarded the returned report entirely, and
+    is_valid was never checked anywhere. The validator worked; nothing
+    listened to it.
+
+    Args:
+        is_valid: First element of TestContextValidator.validate()'s return.
+        report: Second element (formatted report string).
+        repo, commit: For the strict-mode error message.
+        verbose: Whether the caller already printed `report` themselves.
+        strict: If True, raise on invalid rather than just logging.
+    """
+    # Errors must be visible regardless of verbose -- verbose is about
+    # progress narration, not about whether a real problem gets hidden.
+    if not is_valid and not verbose:
+        print(report)
+
+    if strict and not is_valid:
+        raise ValueError(
+            f"TestContext validation failed for {repo} @ {commit[:8]}:\n{report}"
+        )
+
+
+def extract_and_validate(instance, depth=2, verbose=True, strict=False):
     """Extract and validate a subgraph from an instance dict.
 
     This is the core function that works with any patch source (dataset,
@@ -93,7 +124,22 @@ def extract_and_validate(instance, depth=2, verbose=True):
             - code_file: Relative path to code file
             - test_file: Relative path to test file
         depth: BFS depth for subgraph extraction (default 2)
-        verbose: Print progress messages (default True)
+        verbose: Print progress messages (default True). Independent of
+                 error/warning visibility below -- this only controls the
+                 step-by-step narration ("Extracting subgraph...", etc).
+        strict: If True, raise ValueError when TestContextValidator finds a
+                blocking error (e.g. a disconnected seed with no context,
+                or a seed that isn't a function/method/class -- see
+                TestContextValidator._check_seed_types/_check_seed_connectivity).
+                Default False to preserve existing interactive/exploratory
+                behavior; callers that feed extracted context straight into
+                an LLM (rather than a human reviewing the report) should
+                pass True, since a validation error here means the LLM
+                would silently receive a degraded or empty-context seed
+                with no signal that anything was wrong (see
+                kg_construction#54, caught by _check_seed_types but never
+                surfaced because callers never checked is_valid or read
+                the report -- verbose=False discarded it outright).
 
     Returns:
         (context, report) where:
@@ -101,7 +147,8 @@ def extract_and_validate(instance, depth=2, verbose=True):
         - report: Validation report string (errors + warnings)
 
     Raises:
-        ValueError: If code_file not found in KG or other extraction errors
+        ValueError: If code_file not found in KG, other extraction errors,
+                    or (when strict=True) a blocking validation error.
     """
     repo = instance['repo']
     commit = instance['base_commit']
@@ -140,6 +187,8 @@ def extract_and_validate(instance, depth=2, verbose=True):
     is_valid, report = validator.validate()
     if verbose:
         print(report)
+
+    _handle_validation_result(is_valid, report, repo, commit, verbose, strict)
 
     return context, report
 

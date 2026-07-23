@@ -160,3 +160,87 @@ class TestSeedNeverIncludesTestFile:
 
         test_labels = {t["label"] for t in context.test_nodes}
         assert "test_build" in test_labels
+
+
+class TestCallsBasedTestDetection:
+    """kg_construction#57's follow-up investigation: the naming-convention
+    'tests' edge (test_<name> -> <name>, exact match) assumes a test's name
+    mechanically derives from the function it tests -- checked directly
+    against psf/requests' real test suite and found true for only 1 of 159
+    test functions; the rest use descriptive names with no derivable
+    relationship to the function under test, so existing_tests/test_nodes
+    was empty for 21 of 22 real benchmark instances even when a real,
+    directly-relevant test existed. A test that actually CALLS the target
+    function is a naming-independent signal already computable from the
+    ordinary 'calls' edge resolution -- these tests cover deriving 'tests'
+    edges from that instead of/in addition to the naming heuristic.
+    """
+
+    def _write_repo(self, tmp_path):
+        (tmp_path / "mod.py").write_text(
+            "class Widget:\n"
+            "    def build(self):\n"
+            "        return self.helper()\n"
+            "\n"
+            "    def helper(self):\n"
+            "        return 42\n"
+            "\n"
+            "    def unrelated(self):\n"
+            "        return 0\n"
+        )
+        (tmp_path / "test_mod.py").write_text(
+            "from mod import Widget\n"
+            "\n"
+            "def test_descriptive_name_with_no_relation_to_build():\n"
+            "    assert Widget().build() == 42\n"
+            "\n"
+            "def test_covers_unrelated_function():\n"
+            "    assert Widget().unrelated() == 0\n"
+        )
+        return tmp_path
+
+    def _instance(self):
+        patch = (
+            "--- a/mod.py\n"
+            "+++ b/mod.py\n"
+            "@@ -2,3 +2,3 @@\n"
+            "     def build(self):\n"
+            "-        return self.helper()\n"
+            "+        return self.helper() + 1\n"
+        )
+        return {
+            "repo": "test/repo",
+            "base_commit": "deadbeef",
+            "patch": patch,
+            "code_file": "mod.py",
+            "test_file": "test_mod.py",
+        }
+
+    def test_descriptively_named_test_is_found_via_calls_not_naming(self, tmp_path):
+        repo_dir = self._write_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine)
+        context = extractor.extract(self._instance(), depth=2)
+
+        test_labels = {t["label"] for t in context.test_nodes}
+        assert "test_descriptive_name_with_no_relation_to_build" in test_labels
+
+    def test_unrelated_functions_test_is_not_attributed_to_the_seed(self, tmp_path):
+        """A test that calls some OTHER function reachable in the subgraph
+        (here, a sibling method 'unrelated') must not be misattributed as
+        an existing test FOR the seed -- the same scoping bug class as
+        kg-test-generation#49's 'related' list, here for test_nodes.
+        """
+        repo_dir = self._write_repo(tmp_path)
+        parser = RepoASTParser(max_workers=1)
+        kg = parser.parse_repo("test/repo", repo_dir)
+
+        engine = KGQueryEngine(kg)
+        extractor = TestContextExtractor(engine)
+        context = extractor.extract(self._instance(), depth=2)
+
+        test_labels = {t["label"] for t in context.test_nodes}
+        assert "test_covers_unrelated_function" not in test_labels

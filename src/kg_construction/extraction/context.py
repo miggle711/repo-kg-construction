@@ -217,10 +217,23 @@ class TestContextExtractor:
                 seed_ids, subgraph_nodes, subgraph_edges
             )
 
-        # Find test functions via 'tests' edges
+        # Find test functions via 'tests' edges -- restricted to edges
+        # targeting the seed itself (edge['target'] in seed_ids), not any
+        # 'tests' edge anywhere in the depth-N BFS subgraph. Without this
+        # restriction, a test of some unrelated function 1-2 hops away
+        # (e.g. a caller's own test, or a sibling method's test) gets
+        # misattributed as an existing test FOR the seed -- the same class
+        # of scoping bug as the 'related' list (kg-test-generation#49),
+        # here amplified once calls-based 'tests'-edge derivation (added
+        # for kg_construction#57's audit) made 'tests' edges far more
+        # common than the naming-convention-only heuristic ever produced.
+        # Confirmed empirically: handle_401_2017's subgraph contained 372
+        # 'tests'-edge-reachable nodes, but only a handful actually call
+        # handle_401 -- most were tests of other functions/methods nearby.
+        seed_id_set = set(seed_ids)
         test_nodes = []
         for edge in subgraph_edges:
-            if edge['relation'] == 'tests':
+            if edge['relation'] == 'tests' and edge['target'] in seed_id_set:
                 test_node = self.engine.nodes_by_id.get(edge['source'])
                 if test_node:
                     test_nodes.append(test_node)
