@@ -14,8 +14,10 @@ class TestKGValidator:
         """Create a valid minimal KG."""
         return {
             'nodes': [
-                {'id': 'n1', 'label': 'func_a', 'type': 'function', 'metadata': {'filepath': 'a.py'}},
-                {'id': 'n2', 'label': 'func_b', 'type': 'function', 'metadata': {'filepath': 'b.py'}},
+                {'id': 'n1', 'label': 'func_a', 'type': 'function',
+                 'metadata': {'filepath': 'a.py', 'signature': 'def func_a():'}},
+                {'id': 'n2', 'label': 'func_b', 'type': 'function',
+                 'metadata': {'filepath': 'b.py', 'signature': 'def func_b():'}},
             ],
             'edges': [
                 {'source': 'n1', 'target': 'n2', 'relation': 'calls'},
@@ -74,6 +76,100 @@ class TestKGValidator:
         is_valid, report = validator.validate()
         assert 'Nodes:' in report or 'nodes' in report.lower()
         assert 'Edges:' in report or 'edges' in report.lower()
+
+    def test_missing_signature_key_is_flagged(self):
+        """kg-test-generation#51: signature/source_code were never computed
+        for any function/method -- this must be caught, not silently
+        passed, even though 'filepath' (the only key checked before this
+        fix) was present the whole time #51 was live.
+        """
+        kg = {
+            'nodes': [
+                {'id': 'n1', 'label': 'func_a', 'type': 'function', 'metadata': {'filepath': 'a.py'}},
+            ],
+            'edges': [],
+            'metadata': {'repo': 'test/repo'},
+        }
+        validator = KGValidator(kg)
+        is_valid, report = validator.validate()
+        assert 'signature' in report
+
+    def test_empty_string_signature_is_flagged_same_as_missing(self):
+        """A present-but-empty signature (metadata['signature'] == '') is
+        exactly as useless to the LLM as a missing key -- both must be
+        flagged, since key-presence alone doesn't mean real content.
+        """
+        kg = {
+            'nodes': [
+                {'id': 'n1', 'label': 'func_a', 'type': 'function',
+                 'metadata': {'filepath': 'a.py', 'signature': ''}},
+            ],
+            'edges': [],
+            'metadata': {'repo': 'test/repo'},
+        }
+        validator = KGValidator(kg)
+        is_valid, report = validator.validate()
+        assert 'signature' in report
+
+    def test_single_affected_node_is_flagged_not_just_majority(self):
+        """Previously only warned if >50% of nodes in a type were missing
+        a critical key -- a bug affecting a MINORITY of nodes (e.g. one
+        function out of ten with a real parsing edge case) would have
+        been silently ignored. Any affected node must be reported.
+        """
+        kg = {
+            'nodes': [
+                {'id': 'n1', 'label': 'func_a', 'type': 'function',
+                 'metadata': {'filepath': 'a.py', 'signature': 'def func_a():'}},
+                {'id': 'n2', 'label': 'func_b', 'type': 'function',
+                 'metadata': {'filepath': 'b.py', 'signature': 'def func_b():'}},
+                {'id': 'n3', 'label': 'func_c', 'type': 'function',
+                 'metadata': {'filepath': 'c.py'}},  # the one bad node, 1/3
+            ],
+            'edges': [],
+            'metadata': {'repo': 'test/repo'},
+        }
+        validator = KGValidator(kg)
+        is_valid, report = validator.validate()
+        assert 'func_c' in report
+        assert '1/3' in report
+
+    def test_file_node_with_path_key_is_not_flagged(self):
+        """file/test_file nodes use metadata['path'], not metadata['filepath']
+        (a different convention than function/method/class nodes) --
+        _expected_metadata_keys previously declared 'filepath' for these
+        too, which would have flagged every real file/test_file node in
+        every KG the moment this check was strengthened to actually look
+        at real expected keys (caught via a real-dataset sweep).
+        """
+        kg = {
+            'nodes': [
+                {'id': 'n1', 'label': 'mod.py', 'type': 'file', 'metadata': {'path': 'mod.py'}},
+                {'id': 'n2', 'label': 'test_mod.py', 'type': 'test_file', 'metadata': {'path': 'test_mod.py'}},
+            ],
+            'edges': [],
+            'metadata': {'repo': 'test/repo'},
+        }
+        validator = KGValidator(kg)
+        is_valid, report = validator.validate()
+        assert 'file metadata missing' not in report
+        assert 'test_file metadata missing' not in report
+
+    def test_class_node_without_signature_is_not_flagged(self):
+        """Classes aren't expected to have a 'signature' key
+        (_expected_metadata_keys only requires 'filepath' for classes) --
+        this must not produce a false-positive warning.
+        """
+        kg = {
+            'nodes': [
+                {'id': 'n1', 'label': 'MyClass', 'type': 'class', 'metadata': {'filepath': 'a.py'}},
+            ],
+            'edges': [],
+            'metadata': {'repo': 'test/repo'},
+        }
+        validator = KGValidator(kg)
+        is_valid, report = validator.validate()
+        assert 'signature' not in report
 
 
 class TestTestContextValidator:
