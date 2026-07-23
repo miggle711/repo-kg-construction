@@ -57,12 +57,13 @@ class TestContextValidator(ValidationBase):
         self.errors.clear()
         self.warnings.clear()
 
-        # --- Must-haves (5) ---
+        # --- Must-haves (6) ---
         self._check_no_orphaned_nodes()
         self._check_no_broken_edges()
         self._check_seed_connectivity()
         self._check_closed_subgraph()
         self._check_no_duplicate_edges()
+        self._check_no_ambiguous_seed_names()
 
         # --- Should-haves (3) ---
         self._check_test_coverage()
@@ -152,6 +153,46 @@ class TestContextValidator(ValidationBase):
             )
 
     # --- Should-haves ---
+
+    def _check_no_ambiguous_seed_names(self) -> None:
+        """Flag when the same seed LABEL resolves to more than one distinct
+        node -- e.g. two unrelated classes each defining their own
+        'aclose' method, and a patch's changed-function detection finding
+        the name 'aclose' with no way to tell which class's version it
+        actually belongs to (kg_construction#63, found via a real
+        encode/httpx patch to AsyncClient.aclose that also matched the
+        unrelated BoundAsyncStream.aclose in the same file).
+
+        This is an ERROR, not a warning: LLMSerializer._build_seed_section
+        trusts seeds[0] unconditionally, so an unresolved name collision
+        means the model may be shown a completely unrelated function's
+        code as if it were the one the patch actually changed, depending
+        on subgraph node ordering (BFS visited-order, confirmed
+        non-deterministic across runs during kg_construction#54's
+        investigation) -- not a lesser-severity issue than #54's
+        test-file-as-seed defect, just a different trigger for the same
+        failure shape.
+
+        Distinct from a genuine multi-function patch (e.g.
+        api_multi_verb_2012 changing patch/put/request/post together,
+        which correctly produces multiple seeds with DIFFERENT labels):
+        the signal here is specifically the same label resolving to more
+        than one node, not "more than one seed" in general.
+        """
+        seen_ids_by_label: Dict[str, Set[str]] = defaultdict(set)
+        for seed in self.context.seeds:
+            seen_ids_by_label[seed['label']].add(seed['id'])
+
+        ambiguous = [
+            label for label, ids in seen_ids_by_label.items() if len(ids) > 1
+        ]
+
+        if ambiguous:
+            self.errors.append(
+                f"Ambiguous seed names ({len(ambiguous)}): {', '.join(ambiguous[:3])}"
+                " — this name matches more than one distinct function/method "
+                "in this file; seed selection cannot tell them apart"
+            )
 
     def _check_test_coverage(self) -> None:
         """Warn if code_file exists but test_file is missing."""
